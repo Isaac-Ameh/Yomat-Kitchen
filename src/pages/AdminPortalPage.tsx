@@ -244,7 +244,7 @@ interface AiInsightsReport {
 }
 
 export function AdminPortalPage() {
-  const { fullName, email, role, isManager, getToken, signOut } = useAppAuth();
+  const { isClerkConfigured, fullName, email, role, isManager, getToken, signOut } = useAppAuth();
   const { refreshMenuAndSettings } = useMenu();
 
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
@@ -257,6 +257,7 @@ export function AdminPortalPage() {
   const [aiPeriod, setAiPeriod] = useState('monthly');
   const [aiTopic, setAiTopic] = useState('complete');
   const [aiReport, setAiReport] = useState<AiInsightsReport | null>(null);
+  const [aiError, setAiError] = useState<string | null>(null);
   const [generatingAiReport, setGeneratingAiReport] = useState(false);
   const [aiChatMessages, setAiChatMessages] = useState<Array<{ sender: 'manager' | 'ai'; text: string }>>([
     { sender: 'ai', text: 'Hello! I am your AI Business Assistant for Yomat Kitchen. Ask me anything about customer reviews, popular dishes, revenue trends, or staff performance.' },
@@ -317,8 +318,33 @@ export function AdminPortalPage() {
   const [staffList, setStaffList] = useState<StaffProfile[]>([]);
   const [invitations, setInvitations] = useState<StaffInvitation[]>([]);
   const [newInviteEmail, setNewInviteEmail] = useState('');
+  const [newInviteFullName, setNewInviteFullName] = useState('');
+  const [newInvitePasscode, setNewInvitePasscode] = useState('');
   const [newInviteRole, setNewInviteRole] = useState<'staff' | 'owner'>('staff');
   const [inviteError, setInviteError] = useState<string | null>(null);
+
+  const [orderModalOpen, setOrderModalOpen] = useState(false);
+  const [orderCatalogOptions, setOrderCatalogOptions] = useState<
+    Array<{ id: string; name: string; price: number | null }>
+  >([]);
+  const [orderForm, setOrderForm] = useState<{
+    email: string;
+    channel: string;
+    status: AdminOrder['status'];
+    paymentStatus: AdminOrder['payment_status'];
+    mealId: string;
+    quantity: number;
+    unitPriceNaira: number;
+  }>({
+    email: '',
+    channel: 'whatsapp_phone',
+    status: 'confirmed',
+    paymentStatus: 'pending',
+    mealId: '',
+    quantity: 1,
+    unitPriceNaira: 0,
+  });
+  const [creatingOrder, setCreatingOrder] = useState(false);
 
   const [settings, setSettings] = useState<WebsiteSettings>(DEFAULT_WEBSITE_SETTINGS);
   const [activityLogs, setActivityLogs] = useState<ActivityLogRow[]>([]);
@@ -327,7 +353,7 @@ export function AdminPortalPage() {
   const [editingMeal, setEditingMeal] = useState<AdminMeal | null>(null);
   const [mealForm, setMealForm] = useState({
     name: '',
-    category: 'Main Dishes & Meals',
+    category: 'Rice Dishes',
     shortDescription: '',
     fullDescription: '',
     priceNaira: 0,
@@ -371,6 +397,38 @@ export function AdminPortalPage() {
       // Ignore background poll failures
     }
   }, [getToken]);
+
+  const handleMarkNotificationRead = async (id: string) => {
+    try {
+      const token = await getToken();
+      if (!token) return;
+      const res = await fetch(`/api/admin/notifications/${encodeURIComponent(id)}/read`, {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      await parseApiJson<{ success?: boolean }>(res);
+      setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: true } : n)));
+    } catch {
+      // Ignore transient mark-read failures
+    }
+  };
+
+  const handleMarkAllNotificationsRead = async () => {
+    try {
+      const token = await getToken();
+      if (!token) return;
+      const res = await fetch('/api/admin/notifications/read-all', {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      await parseApiJson<{ success?: boolean }>(res);
+      setNotifications((prev) => prev.map((n) => ({ ...n, is_read: true })));
+    } catch {
+      // Ignore transient mark-all-read failures
+    }
+  };
 
   const loadReports = useCallback(
     async (token: string) => {
@@ -517,7 +575,7 @@ export function AdminPortalPage() {
           const data = await parseApiJson<{ reviews?: AdminReviewRecord[] }>(res);
           setAdminReviews(data.reviews || []);
         } else if (tab === 'ai_insights' && isManager) {
-          if (!aiReport) {
+          if (!aiReport && !aiError) {
             await handleGenerateAiReport(token, 'monthly', 'complete');
           }
         }
@@ -527,7 +585,7 @@ export function AdminPortalPage() {
         setLoadingData(false);
       }
     },
-    [getToken, orderStatusFilter, isManager, loadReports]
+    [getToken, orderStatusFilter, isManager, loadReports, aiReport, aiError]
   );
 
   useEffect(() => {
@@ -539,6 +597,77 @@ export function AdminPortalPage() {
   useEffect(() => {
     void loadTabData(activeTab);
   }, [activeTab, loadTabData]);
+
+  const handleOpenOrderModal = async () => {
+    setErrorBanner(null);
+    try {
+      const res = await fetch('/api/menu', { credentials: 'same-origin' });
+      const data = await parseApiJson<{
+        meals?: Array<{ id: string; name: string; price: number | null }>;
+      }>(res);
+      const list = data.meals || [];
+      setOrderCatalogOptions(list);
+      const first = list[0];
+      setOrderForm({
+        email: '',
+        channel: 'whatsapp_phone',
+        status: 'confirmed',
+        paymentStatus: 'pending',
+        mealId: first?.id || '',
+        quantity: 1,
+        unitPriceNaira: first?.price && first.price > 0 ? first.price : 0,
+      });
+      setOrderModalOpen(true);
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : 'Failed to load menu catalog.');
+    }
+  };
+
+  const handleCreateOrder = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!orderForm.mealId) {
+      setErrorBanner('Select a dish item before recording an order.');
+      return;
+    }
+    setCreatingOrder(true);
+    setErrorBanner(null);
+    try {
+      const token = await getToken();
+      if (!token) return;
+      const res = await fetch('/api/admin/orders', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          email: orderForm.email.trim() || 'walkin@yomatkitchen.ng',
+          channel: orderForm.channel,
+          status: orderForm.status,
+          paymentStatus: isManager ? orderForm.paymentStatus : 'pending',
+          items: [
+            {
+              mealId: orderForm.mealId,
+              quantity: Math.max(1, Number(orderForm.quantity) || 1),
+              unitPriceNaira: Math.max(0, Number(orderForm.unitPriceNaira) || 0),
+            },
+          ],
+        }),
+      });
+      const data = await parseApiJson<{ order?: { reference?: string } }>(
+        res,
+        'Failed to record kitchen order.'
+      );
+      setOrderModalOpen(false);
+      await Promise.all([loadTabData('orders'), loadNotifications()]);
+      showSuccess(`Recorded order ${data.order?.reference || ''} successfully.`);
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : 'Error recording order.');
+    } finally {
+      setCreatingOrder(false);
+    }
+  };
 
   const handleUpdateOrderStatus = async (reference: string, status: string) => {
     try {
@@ -553,12 +682,9 @@ export function AdminPortalPage() {
         },
         body: JSON.stringify({ status }),
       });
-      if (!res.ok) {
-        const d = (await res.json()) as { error?: string };
-        throw new Error(d.error || 'Failed to update order status.');
-      }
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to update order status.');
       await loadTabData('orders');
-      if (selectedOrder) {
+      if (selectedOrder && selectedOrder.reference === reference) {
         setSelectedOrder((prev) =>
           prev ? { ...prev, status: status as AdminOrder['status'] } : null
         );
@@ -566,6 +692,33 @@ export function AdminPortalPage() {
       showSuccess(`Order ${reference} updated to ${status}.`);
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Error updating order.');
+    }
+  };
+
+  const handleUpdateOrderPayment = async (
+    reference: string,
+    paymentStatus: AdminOrder['payment_status']
+  ) => {
+    try {
+      const token = await getToken();
+      if (!token) return;
+      const res = await fetch(`/api/admin/orders/${encodeURIComponent(reference)}`, {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ paymentStatus }),
+      });
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to update payment status.');
+      await loadTabData('orders');
+      if (selectedOrder && selectedOrder.reference === reference) {
+        setSelectedOrder((prev) => (prev ? { ...prev, payment_status: paymentStatus } : null));
+      }
+      showSuccess(`Payment for ${reference} marked as ${paymentStatus}.`);
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : 'Error updating payment status.');
     }
   };
 
@@ -636,10 +789,7 @@ export function AdminPortalPage() {
         body: JSON.stringify(mealForm),
       });
 
-      if (!res.ok) {
-        const d = (await res.json()) as { error?: string };
-        throw new Error(d.error || 'Failed to save dish.');
-      }
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to save dish.');
 
       setMealModalOpen(false);
       setEditingMeal(null);
@@ -659,10 +809,7 @@ export function AdminPortalPage() {
         credentials: 'same-origin',
         headers: { Authorization: `Bearer ${token}` },
       });
-      const data = (await res.json()) as { error?: string };
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to delete dish.');
-      }
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to delete dish.');
       await Promise.all([loadTabData('menu'), refreshMenuAndSettings()]);
       showSuccess('Dish removed from menu.');
     } catch (err) {
@@ -701,10 +848,9 @@ export function AdminPortalPage() {
         },
         body: JSON.stringify({ name: newCategoryName }),
       });
-      const data = (await res.json()) as { error?: string };
-      if (!res.ok) throw new Error(data.error || 'Failed to create category.');
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to create category.');
       setNewCategoryName('');
-      await loadTabData('menu');
+      await Promise.all([loadTabData('menu'), refreshMenuAndSettings()]);
       showSuccess('Menu category added.');
     } catch (err) {
       setCategoryError(err instanceof Error ? err.message : 'Error creating category.');
@@ -720,9 +866,8 @@ export function AdminPortalPage() {
         credentials: 'same-origin',
         headers: { Authorization: `Bearer ${token}` },
       });
-      const data = (await res.json()) as { error?: string };
-      if (!res.ok) throw new Error(data.error || 'Failed to delete category.');
-      await loadTabData('menu');
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to delete category.');
+      await Promise.all([loadTabData('menu'), refreshMenuAndSettings()]);
       showSuccess('Category removed.');
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Error deleting category.');
@@ -743,8 +888,7 @@ export function AdminPortalPage() {
         },
         body: JSON.stringify(cateringForm),
       });
-      const data = (await res.json()) as { error?: string };
-      if (!res.ok) throw new Error(data.error || 'Failed to record catering enquiry.');
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to record catering enquiry.');
       setCateringFormOpen(false);
       setCateringForm({
         clientName: '',
@@ -756,7 +900,7 @@ export function AdminPortalPage() {
         requestedDishes: '',
         notes: '',
       });
-      await loadTabData('catering');
+      await Promise.all([loadTabData('catering'), loadNotifications()]);
       showSuccess('Catering enquiry recorded.');
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Error recording catering enquiry.');
@@ -813,13 +957,26 @@ export function AdminPortalPage() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ email: newInviteEmail, role: newInviteRole }),
+        body: JSON.stringify({
+          email: newInviteEmail.trim(),
+          fullName: newInviteFullName.trim() || undefined,
+          passcode: newInvitePasscode.trim() || undefined,
+          role: newInviteRole,
+        }),
       });
-      const data = (await res.json()) as { error?: string };
-      if (!res.ok) throw new Error(data.error || 'Failed to send invitation.');
+      const data = await parseApiJson<{ activated?: boolean }>(
+        res,
+        'Failed to create team account or invitation.'
+      );
       setNewInviteEmail('');
+      setNewInviteFullName('');
+      setNewInvitePasscode('');
       await loadTabData('staff');
-      showSuccess('Team invitation created.');
+      showSuccess(
+        data.activated
+          ? 'Team member account activated with portal passcode.'
+          : 'Team invitation created.'
+      );
     } catch (err) {
       setInviteError(err instanceof Error ? err.message : 'Error inviting staff.');
     }
@@ -838,8 +995,7 @@ export function AdminPortalPage() {
         },
         body: JSON.stringify({ status: newStatus }),
       });
-      const data = await parseApiJson<{ success?: boolean; error?: string }>(res);
-      if (!res.ok) throw new Error(data.error || 'Failed to update review status.');
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to update review status.');
       await loadTabData('reviews');
       showSuccess(`Review status updated to ${newStatus}.`);
     } catch (err) {
@@ -849,7 +1005,7 @@ export function AdminPortalPage() {
 
   const handleGenerateAiReport = async (overrideToken?: string, periodParam?: string, topicParam?: string) => {
     setGeneratingAiReport(true);
-    setErrorBanner(null);
+    setAiError(null);
     try {
       const token = overrideToken || (await getToken());
       if (!token) return;
@@ -865,12 +1021,17 @@ export function AdminPortalPage() {
           topic: topicParam || aiTopic,
         }),
       });
-      const data = await parseApiJson<{ report?: AiInsightsReport; error?: string }>(res);
-      if (!res.ok || !data.report) throw new Error(data.error || 'Failed to generate AI business report.');
+      const data = await parseApiJson<{ report?: AiInsightsReport }>(
+        res,
+        'Failed to generate AI business insights report.'
+      );
+      if (!data.report) {
+        throw new Error('Failed to generate AI business report.');
+      }
       setAiReport(data.report);
       showSuccess('AI Management Insights report generated successfully!');
     } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : 'Error generating AI insights.');
+      setAiError(err instanceof Error ? err.message : 'Error generating AI insights.');
     } finally {
       setGeneratingAiReport(false);
     }
@@ -896,17 +1057,22 @@ export function AdminPortalPage() {
         },
         body: JSON.stringify({ question }),
       });
-      const data = await parseApiJson<{ answer?: string; error?: string }>(res);
-      const answer = data.answer || data.error || 'No response generated.';
+      const data = await parseApiJson<{ answer?: string }>(
+        res,
+        'Unable to get an answer from AI Business Assistant.'
+      );
+      const answer = data.answer || 'No response generated.';
       setAiChatMessages((prev) => {
         const next = [...prev];
         next[next.length - 1] = { sender: 'ai', text: answer };
         return next;
       });
     } catch (err) {
+      const errorText =
+        err instanceof Error ? err.message : 'Error connecting to AI Business Assistant.';
       setAiChatMessages((prev) => {
         const next = [...prev];
-        next[next.length - 1] = { sender: 'ai', text: 'Error connecting to AI Business Assistant.' };
+        next[next.length - 1] = { sender: 'ai', text: errorText };
         return next;
       });
     } finally {
@@ -927,8 +1093,7 @@ export function AdminPortalPage() {
         },
         body: JSON.stringify({ role: nextRole }),
       });
-      const data = (await res.json()) as { error?: string };
-      if (!res.ok) throw new Error(data.error || 'Failed to change team role.');
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to change team role.');
       await loadTabData('staff');
       showSuccess('Team member role updated.');
     } catch (err) {
@@ -945,8 +1110,7 @@ export function AdminPortalPage() {
         credentials: 'same-origin',
         headers: { Authorization: `Bearer ${token}` },
       });
-      const data = (await res.json()) as { error?: string };
-      if (!res.ok) throw new Error(data.error || 'Failed to revoke access.');
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to revoke access.');
       await loadTabData('staff');
       showSuccess('Staff access revoked.');
     } catch (err) {
@@ -1089,7 +1253,18 @@ export function AdminPortalPage() {
                 <div className="absolute right-0 mt-2 w-80 sm:w-96 bg-[#FFFFFF] rounded-xl border border-[#1C1917]/15 shadow-xl py-3 z-50">
                   <div className="px-4 pb-2 border-b border-[#1C1917]/10 flex items-center justify-between">
                     <h3 className="text-sm font-semibold text-[#1C1917]">Notifications</h3>
-                    <span className="text-xs text-[#57534E]">{notifications.length} recent</span>
+                    <div className="flex items-center gap-3">
+                      {unreadNotificationsCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => void handleMarkAllNotificationsRead()}
+                          className="text-xs font-medium text-[#5A0B1E] hover:underline cursor-pointer"
+                        >
+                          Mark all read
+                        </button>
+                      )}
+                      <span className="text-xs text-[#57534E]">{notifications.length} recent</span>
+                    </div>
                   </div>
                   <div className="max-h-80 overflow-y-auto divide-y divide-[#1C1917]/8">
                     {notifications.length === 0 ? (
@@ -1098,9 +1273,30 @@ export function AdminPortalPage() {
                       </p>
                     ) : (
                       notifications.map((n) => (
-                        <div key={n.id} className="px-4 py-3 hover:bg-[#FAF7F2] transition-colors">
-                          <p className="text-xs font-semibold text-[#1C1917]">{n.title}</p>
-                          <p className="text-xs text-[#57534E] mt-0.5">{n.message}</p>
+                        <div
+                          key={n.id}
+                          className={`px-4 py-3 hover:bg-[#FAF7F2] transition-colors flex items-start justify-between gap-3 ${
+                            !n.is_read ? 'bg-[#5A0B1E]/[0.03]' : ''
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <p className="text-xs font-semibold text-[#1C1917] flex items-center gap-1.5">
+                              {!n.is_read && (
+                                <span className="w-2 h-2 rounded-full bg-[#B91C1C] shrink-0" />
+                              )}
+                              <span className="truncate">{n.title}</span>
+                            </p>
+                            <p className="text-xs text-[#57534E] mt-0.5">{n.message}</p>
+                          </div>
+                          {!n.is_read && (
+                            <button
+                              type="button"
+                              onClick={() => void handleMarkNotificationRead(n.id)}
+                              className="text-[11px] font-medium text-[#5A0B1E] hover:underline shrink-0 cursor-pointer"
+                            >
+                              Mark read
+                            </button>
+                          )}
                         </div>
                       ))
                     )}
@@ -1595,7 +1791,7 @@ export function AdminPortalPage() {
                       setEditingMeal(null);
                       setMealForm({
                         name: '',
-                        category: 'Main Dishes & Meals',
+                        category: categories[0]?.name || 'Rice Dishes',
                         shortDescription: '',
                         fullDescription: '',
                         priceNaira: 0,
@@ -1696,23 +1892,34 @@ export function AdminPortalPage() {
           {/* ================= 3. ORDER MANAGEMENT (STAFF + MANAGER) ================= */}
           {activeTab === 'orders' && (
             <div className="space-y-6">
-              <div className="flex flex-wrap items-center gap-2">
-                {['all', 'pending', 'confirmed', 'preparing', 'ready', 'completed', 'cancelled'].map(
-                  (st) => (
-                    <button
-                      key={st}
-                      type="button"
-                      onClick={() => setOrderStatusFilter(st)}
-                      className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold uppercase tracking-wider transition-colors cursor-pointer ${
-                        orderStatusFilter === st
-                          ? 'bg-[#5A0B1E] text-white'
-                          : 'bg-[#FFFFFF] text-[#57534E] border border-[#1C1917]/10 hover:bg-[#F3EEE6]'
-                      }`}
-                    >
-                      {st}
-                    </button>
-                  )
-                )}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  {['all', 'pending', 'confirmed', 'preparing', 'ready', 'completed', 'cancelled'].map(
+                    (st) => (
+                      <button
+                        key={st}
+                        type="button"
+                        onClick={() => setOrderStatusFilter(st)}
+                        className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold uppercase tracking-wider transition-colors cursor-pointer ${
+                          orderStatusFilter === st
+                            ? 'bg-[#5A0B1E] text-white'
+                            : 'bg-[#FFFFFF] text-[#57534E] border border-[#1C1917]/10 hover:bg-[#F3EEE6]'
+                        }`}
+                      >
+                        {st}
+                      </button>
+                    )
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => void handleOpenOrderModal()}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#5A0B1E] hover:bg-[#731129] text-white text-xs font-semibold transition-colors cursor-pointer shrink-0"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Record Phone / Walk-in Order</span>
+                </button>
               </div>
 
               <div className="bg-[#FFFFFF] rounded-xl border border-[#1C1917]/10 overflow-hidden">
@@ -1721,7 +1928,7 @@ export function AdminPortalPage() {
                     <thead>
                       <tr className="bg-[#FAF7F2] border-b border-[#1C1917]/10 text-xs font-semibold uppercase tracking-wider text-[#57534E]">
                         <th className="py-3.5 px-4">Order Ref</th>
-                        <th className="py-3.5 px-4">Customer Email</th>
+                        <th className="py-3.5 px-4">Customer Contact</th>
                         <th className="py-3.5 px-4">Total</th>
                         <th className="py-3.5 px-4">Payment</th>
                         <th className="py-3.5 px-4">Order Status</th>
@@ -1741,21 +1948,46 @@ export function AdminPortalPage() {
                           <tr key={ord.reference} className="hover:bg-[#FAF7F2]/60 transition-colors">
                             <td className="py-4 px-4 font-mono font-semibold text-[#1C1917]">
                               {ord.reference}
+                              {ord.channel && (
+                                <span className="block text-[10px] font-sans font-normal text-[#57534E] uppercase">
+                                  {ord.channel.replace('_', ' ')}
+                                </span>
+                              )}
                             </td>
                             <td className="py-4 px-4 text-[#57534E]">{ord.email}</td>
                             <td className="py-4 px-4 tabular-nums font-semibold text-[#15803D]">
                               {formatNaira(ord.total_naira)}
                             </td>
                             <td className="py-4 px-4">
-                              <span
-                                className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded ${
-                                  ord.payment_status === 'paid'
-                                    ? 'bg-[#15803D]/12 text-[#15803D]'
-                                    : 'bg-[#D97706]/12 text-[#B45309]'
-                                }`}
-                              >
-                                {ord.payment_status}
-                              </span>
+                              {isManager ? (
+                                <select
+                                  value={ord.payment_status}
+                                  onChange={(e) =>
+                                    void handleUpdateOrderPayment(
+                                      ord.reference,
+                                      e.target.value as AdminOrder['payment_status']
+                                    )
+                                  }
+                                  className={`text-[11px] font-bold uppercase px-2 py-1 rounded border border-[#1C1917]/15 cursor-pointer ${
+                                    ord.payment_status === 'paid'
+                                      ? 'bg-[#15803D]/12 text-[#15803D]'
+                                      : 'bg-[#D97706]/12 text-[#B45309]'
+                                  }`}
+                                >
+                                  <option value="pending">pending</option>
+                                  <option value="paid">paid</option>
+                                </select>
+                              ) : (
+                                <span
+                                  className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded ${
+                                    ord.payment_status === 'paid'
+                                      ? 'bg-[#15803D]/12 text-[#15803D]'
+                                      : 'bg-[#D97706]/12 text-[#B45309]'
+                                  }`}
+                                >
+                                  {ord.payment_status}
+                                </span>
+                              )}
                             </td>
                             <td className="py-4 px-4">
                               <select
@@ -2049,21 +2281,41 @@ export function AdminPortalPage() {
             <div className="space-y-8">
               <div className="bg-[#FFFFFF] rounded-xl border border-[#1C1917]/10 p-6 space-y-4">
                 <h2 className="font-display text-xl font-semibold text-[#1C1917]">
-                  Invite Staff or Manager
+                  Add Staff or Manager
                 </h2>
                 <p className="text-xs text-[#57534E]">
-                  Staff members can view orders and update preparation status only. Managers receive
-                  full access across pricing, website settings, analytics, reports, and team
-                  management.
+                  Staff members can view and record kitchen orders and update preparation status
+                  only. Managers receive full access across pricing, website settings, analytics,
+                  reports, and team management.
+                  {!isClerkConfigured &&
+                    ' Provide a portal passcode (at least 6 characters) so the team member can sign in directly at /admin.'}
                 </p>
-                <form onSubmit={handleInviteStaff} className="flex flex-col sm:flex-row gap-3">
+                <form onSubmit={handleInviteStaff} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                  <input
+                    type="text"
+                    placeholder="Full Name (e.g. Chinedu)"
+                    value={newInviteFullName}
+                    onChange={(e) => setNewInviteFullName(e.target.value)}
+                    className="px-4 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
+                  />
                   <input
                     type="email"
                     required
                     placeholder="team@yomatkitchen.ng"
                     value={newInviteEmail}
                     onChange={(e) => setNewInviteEmail(e.target.value)}
-                    className="flex-1 px-4 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
+                    className="px-4 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
+                  />
+                  <input
+                    type="password"
+                    required={!isClerkConfigured}
+                    minLength={isClerkConfigured ? undefined : 6}
+                    placeholder={
+                      isClerkConfigured ? 'Portal passcode (optional)' : 'Portal passcode (min 6 chars)'
+                    }
+                    value={newInvitePasscode}
+                    onChange={(e) => setNewInvitePasscode(e.target.value)}
+                    className="px-4 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
                   />
                   <select
                     value={newInviteRole}
@@ -2077,7 +2329,7 @@ export function AdminPortalPage() {
                     type="submit"
                     className="px-6 py-2.5 rounded-lg bg-[#5A0B1E] hover:bg-[#731129] text-white text-sm font-medium transition-colors cursor-pointer"
                   >
-                    Send Invitation
+                    {!isClerkConfigured || newInvitePasscode.trim() ? 'Add Team Member' : 'Send Invitation'}
                   </button>
                 </form>
                 {inviteError && <p className="text-xs text-[#B91C1C]">{inviteError}</p>}
@@ -2202,15 +2454,28 @@ export function AdminPortalPage() {
                   <button
                     type="button"
                     onClick={() => {
+                      const csvCell = (val: unknown) => {
+                        let str = String(val ?? '');
+                        if (/^[=+\-@\t\r]/.test(str)) {
+                          str = `'${str}`;
+                        }
+                        return `"${str.replace(/"/g, '""')}"`;
+                      };
                       const csv =
                         'Reference,Email,TotalNaira,PaymentStatus,Status,CreatedAt\n' +
                         reportRows
-                          .map(
-                            (r) =>
-                              `${r.reference},${r.email},${r.total_naira},${r.payment_status},${r.status},${r.created_at}`
+                          .map((r) =>
+                            [
+                              csvCell(r.reference),
+                              csvCell(r.email),
+                              csvCell(r.total_naira),
+                              csvCell(r.payment_status),
+                              csvCell(r.status),
+                              csvCell(r.created_at),
+                            ].join(',')
                           )
                           .join('\n');
-                      const blob = new Blob([csv], { type: 'text/csv' });
+                      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
                       const url = URL.createObjectURL(blob);
                       const a = document.createElement('a');
                       a.href = url;
@@ -2218,6 +2483,7 @@ export function AdminPortalPage() {
                         .toISOString()
                         .slice(0, 10)}.csv`;
                       a.click();
+                      URL.revokeObjectURL(url);
                     }}
                     className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#5A0B1E] text-white text-xs font-semibold hover:bg-[#731129] cursor-pointer"
                   >
@@ -2756,10 +3022,20 @@ export function AdminPortalPage() {
                 </div>
               </div>
 
-              {aiReport ? (
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-                  {/* Report Card */}
-                  <div className="lg:col-span-8 space-y-6">
+              {aiError && (
+                <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 text-sm text-amber-900 flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <p className="font-semibold">AI Insights Configuration Notice</p>
+                    <p className="text-xs leading-relaxed">{aiError}</p>
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                {/* Report Card */}
+                <div className="lg:col-span-8 space-y-6">
+                  {aiReport ? (
                     <div className="bg-[#FFFFFF] rounded-xl border border-[#1C1917]/10 p-6 sm:p-8 space-y-6 shadow-sm">
                       <div className="border-b border-[#1C1917]/10 pb-4">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-[#5A0B1E]">
@@ -2849,69 +3125,69 @@ export function AdminPortalPage() {
                         {aiReport.dataCoverageNote}
                       </p>
                     </div>
+                  ) : (
+                    <div className="text-center py-16 px-6 bg-white rounded-xl border border-[#1C1917]/10 space-y-4">
+                      <Sparkles className="w-10 h-10 text-[#5A0B1E] mx-auto" />
+                      <p className="text-sm font-semibold text-[#1C1917]">
+                        Select a reporting period and click &ldquo;Generate AI Report&rdquo; to analyze Yomat Kitchen metrics.
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                {/* AI Assistant Chat Box */}
+                <div className="lg:col-span-4 flex flex-col bg-[#FFFFFF] rounded-xl border border-[#1C1917]/10 p-5 shadow-sm h-[600px]">
+                  <div className="flex items-center gap-2 pb-3 border-b border-[#1C1917]/10">
+                    <div className="w-8 h-8 rounded-lg bg-[#5A0B1E] text-white flex items-center justify-center">
+                      <Sparkles className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <h3 className="font-display text-sm font-semibold text-[#1C1917]">
+                        AI Business Assistant
+                      </h3>
+                      <p className="text-[10px] text-[#57534E]">Ask anything about restaurant data</p>
+                    </div>
                   </div>
 
-                  {/* AI Assistant Chat Box */}
-                  <div className="lg:col-span-4 flex flex-col bg-[#FFFFFF] rounded-xl border border-[#1C1917]/10 p-5 shadow-sm h-[600px]">
-                    <div className="flex items-center gap-2 pb-3 border-b border-[#1C1917]/10">
-                      <div className="w-8 h-8 rounded-lg bg-[#5A0B1E] text-white flex items-center justify-center">
-                        <Sparkles className="w-4 h-4" />
-                      </div>
-                      <div>
-                        <h3 className="font-display text-sm font-semibold text-[#1C1917]">
-                          AI Business Assistant
-                        </h3>
-                        <p className="text-[10px] text-[#57534E]">Ask anything about restaurant data</p>
-                      </div>
-                    </div>
-
-                    <div className="flex-1 overflow-y-auto py-4 space-y-3 pr-1">
-                      {aiChatMessages.map((msg, idx) => (
+                  <div className="flex-1 overflow-y-auto py-4 space-y-3 pr-1">
+                    {aiChatMessages.map((msg, idx) => (
+                      <div
+                        key={idx}
+                        className={`flex flex-col ${
+                          msg.sender === 'manager' ? 'items-end' : 'items-start'
+                        }`}
+                      >
                         <div
-                          key={idx}
-                          className={`flex flex-col ${
-                            msg.sender === 'manager' ? 'items-end' : 'items-start'
+                          className={`max-w-[85%] p-3 rounded-xl text-xs leading-relaxed ${
+                            msg.sender === 'manager'
+                              ? 'bg-[#5A0B1E] text-white rounded-br-none'
+                              : 'bg-[#FAF7F2] text-[#1C1917] border border-[#1C1917]/8 rounded-bl-none'
                           }`}
                         >
-                          <div
-                            className={`max-w-[85%] p-3 rounded-xl text-xs leading-relaxed ${
-                              msg.sender === 'manager'
-                                ? 'bg-[#5A0B1E] text-white rounded-br-none'
-                                : 'bg-[#FAF7F2] text-[#1C1917] border border-[#1C1917]/8 rounded-bl-none'
-                            }`}
-                          >
-                            {msg.text}
-                          </div>
+                          {msg.text}
                         </div>
-                      ))}
-                    </div>
-
-                    <form onSubmit={handleSendAiChat} className="pt-3 border-t border-[#1C1917]/10 flex gap-2">
-                      <input
-                        type="text"
-                        value={aiChatInput}
-                        onChange={(e) => setAiChatInput(e.target.value)}
-                        placeholder="Ask e.g. Which meal has the highest rating?"
-                        className="flex-1 px-3 py-2 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-xs text-[#1C1917]"
-                      />
-                      <button
-                        type="submit"
-                        disabled={sendingAiChat || !aiChatInput.trim()}
-                        className="px-3 py-2 rounded-lg bg-[#5A0B1E] text-white text-xs font-semibold hover:bg-[#731129] disabled:opacity-50 cursor-pointer"
-                      >
-                        Send
-                      </button>
-                    </form>
+                      </div>
+                    ))}
                   </div>
+
+                  <form onSubmit={handleSendAiChat} className="pt-3 border-t border-[#1C1917]/10 flex gap-2">
+                    <input
+                      type="text"
+                      value={aiChatInput}
+                      onChange={(e) => setAiChatInput(e.target.value)}
+                      placeholder="Ask e.g. Which meal has the highest rating?"
+                      className="flex-1 px-3 py-2 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-xs text-[#1C1917]"
+                    />
+                    <button
+                      type="submit"
+                      disabled={sendingAiChat || !aiChatInput.trim()}
+                      className="px-3 py-2 rounded-lg bg-[#5A0B1E] text-white text-xs font-semibold hover:bg-[#731129] disabled:opacity-50 cursor-pointer"
+                    >
+                      Send
+                    </button>
+                  </form>
                 </div>
-              ) : (
-                <div className="text-center py-16 bg-white rounded-xl border border-[#1C1917]/10 space-y-4">
-                  <Sparkles className="w-12 h-12 text-[#5A0B1E] mx-auto animate-pulse" />
-                  <p className="text-sm font-semibold text-[#1C1917]">
-                    Click "Generate AI Report" to analyze Yomat Kitchen business metrics and customer reviews.
-                  </p>
-                </div>
-              )}
+              </div>
             </div>
           )}
         </main>
@@ -2989,6 +3265,176 @@ export function AdminPortalPage() {
                 Close
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================= RECORD PHONE / WALK-IN ORDER MODAL ================= */}
+      {orderModalOpen && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-[#FFFFFF] rounded-xl border border-[#1C1917]/15 max-w-md w-full p-6 sm:p-8 space-y-5 my-8 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-[#1C1917]/10">
+              <h3 className="font-display text-xl font-semibold text-[#1C1917]">
+                Record Phone / Walk-in Order
+              </h3>
+              <button
+                type="button"
+                onClick={() => setOrderModalOpen(false)}
+                className="p-1 rounded-lg text-[#57534E]"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateOrder} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-[#57534E] mb-1">
+                  Customer Name, Phone, or Email
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={orderForm.email}
+                  onChange={(e) => setOrderForm({ ...orderForm, email: e.target.value })}
+                  placeholder="e.g. 0803... / Ada UNIBEN / customer@email.com"
+                  className="w-full px-3.5 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-[#57534E] mb-1">
+                    Order Channel
+                  </label>
+                  <select
+                    value={orderForm.channel}
+                    onChange={(e) => setOrderForm({ ...orderForm, channel: e.target.value })}
+                    className="w-full px-3 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
+                  >
+                    <option value="whatsapp_phone">WhatsApp Order</option>
+                    <option value="phone_call">Phone Call</option>
+                    <option value="walk_in">Walk-in Counter</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-[#57534E] mb-1">
+                    Initial Status
+                  </label>
+                  <select
+                    value={orderForm.status}
+                    onChange={(e) =>
+                      setOrderForm({
+                        ...orderForm,
+                        status: e.target.value as AdminOrder['status'],
+                      })
+                    }
+                    className="w-full px-3 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
+                  >
+                    <option value="confirmed">Confirmed</option>
+                    <option value="pending">Pending</option>
+                    <option value="preparing">Preparing</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-[#57534E] mb-1">
+                  Menu Dish
+                </label>
+                <select
+                  required
+                  value={orderForm.mealId}
+                  onChange={(e) => {
+                    const selected = orderCatalogOptions.find((m) => m.id === e.target.value);
+                    setOrderForm({
+                      ...orderForm,
+                      mealId: e.target.value,
+                      unitPriceNaira: selected?.price && selected.price > 0 ? selected.price : 0,
+                    });
+                  }}
+                  className="w-full px-3 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
+                >
+                  {orderCatalogOptions.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name} {m.price && m.price > 0 ? `(${formatNaira(m.price)})` : '(Quote Price)'}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-[#57534E] mb-1">
+                    Quantity
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={99}
+                    required
+                    value={orderForm.quantity}
+                    onChange={(e) =>
+                      setOrderForm({ ...orderForm, quantity: Number(e.target.value) || 1 })
+                    }
+                    className="w-full px-3.5 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-[#57534E] mb-1">
+                    Unit Price (₦ NGN)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step={50}
+                    required
+                    value={orderForm.unitPriceNaira}
+                    onChange={(e) =>
+                      setOrderForm({ ...orderForm, unitPriceNaira: Number(e.target.value) || 0 })
+                    }
+                    className="w-full px-3.5 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
+                  />
+                </div>
+              </div>
+
+              {isManager && (
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-[#57534E] mb-1">
+                    Payment Status
+                  </label>
+                  <select
+                    value={orderForm.paymentStatus}
+                    onChange={(e) =>
+                      setOrderForm({
+                        ...orderForm,
+                        paymentStatus: e.target.value as AdminOrder['payment_status'],
+                      })
+                    }
+                    className="w-full px-3 py-2.5 rounded-lg border border-[#1C1917]/20 bg-[#FAF7F2] text-sm text-[#1C1917]"
+                  >
+                    <option value="pending">Pending Payment</option>
+                    <option value="paid">Paid (Confirmed)</option>
+                  </select>
+                </div>
+              )}
+
+              <div className="pt-2 flex justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setOrderModalOpen(false)}
+                  className="px-4 py-2 rounded-lg border border-[#1C1917]/15 text-sm font-medium text-[#1C1917] hover:bg-[#F3EEE6] cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={creatingOrder}
+                  className="px-5 py-2 rounded-lg bg-[#5A0B1E] text-white text-sm font-semibold hover:bg-[#731129] disabled:opacity-50 cursor-pointer"
+                >
+                  {creatingOrder ? 'Saving Order...' : 'Record Order'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

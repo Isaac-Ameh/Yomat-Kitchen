@@ -72,10 +72,67 @@ export function ClerkAuthControls({
   variant = 'desktop',
   onAction,
 }: ClerkAuthControlsProps) {
-  const { isClerkConfigured, isSignedIn, canAccessAdmin, fullName, signOut } =
+  const { isClerkConfigured, isSignedIn, canAccessAdmin, userId, fullName, signOut } =
     useAppAuth();
 
   if (!isClerkConfigured) {
+    if (isSignedIn && canAccessAdmin) {
+      if (variant === 'desktop') {
+        return (
+          <div className="flex items-center gap-2 shrink-0">
+            <Link
+              to="/admin"
+              onClick={onAction}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap shrink-0 ${
+                isOverDarkHero
+                  ? 'text-[#FAF7F2]/90 hover:text-white hover:bg-white/10'
+                  : 'text-[#5A0B1E] hover:bg-[#5A0B1E]/8'
+              }`}
+            >
+              <ShieldCheck className="w-4 h-4" />
+              <span>Admin Portal</span>
+            </Link>
+            <button
+              type="button"
+              onClick={() => {
+                onAction?.();
+                void signOut();
+              }}
+              className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                isOverDarkHero
+                  ? 'text-[#FAF7F2]/90 hover:text-white hover:bg-white/10'
+                  : 'text-[#B91C1C] hover:bg-[#B91C1C]/8'
+              }`}
+            >
+              Sign Out
+            </button>
+          </div>
+        );
+      }
+
+      return (
+        <div className="space-y-2 pt-2">
+          <Link
+            to="/admin"
+            onClick={onAction}
+            className="block w-full px-3 py-2.5 rounded-lg text-base font-medium text-[#5A0B1E] hover:bg-[#5A0B1E]/8 transition-colors"
+          >
+            Admin Portal {fullName ? `(${fullName})` : ''}
+          </Link>
+          <button
+            type="button"
+            onClick={() => {
+              onAction?.();
+              void signOut();
+            }}
+            className="w-full text-left px-3 py-2.5 rounded-lg text-base font-medium text-[#B91C1C] hover:bg-[#B91C1C]/8 transition-colors cursor-pointer"
+          >
+            Sign Out
+          </button>
+        </div>
+      );
+    }
+
     return (
       <SignedOutButtons
         isOverDarkHero={isOverDarkHero}
@@ -86,6 +143,39 @@ export function ClerkAuthControls({
   }
 
   if (variant === 'desktop') {
+    if (isSignedIn && canAccessAdmin && userId === 'portal-owner') {
+      return (
+        <div className="flex items-center gap-2 shrink-0">
+          <Link
+            to="/admin"
+            onClick={onAction}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap shrink-0 ${
+              isOverDarkHero
+                ? 'text-[#FAF7F2]/90 hover:text-white hover:bg-white/10'
+                : 'text-[#5A0B1E] hover:bg-[#5A0B1E]/8'
+            }`}
+          >
+            <ShieldCheck className="w-4 h-4" />
+            <span>Admin Portal</span>
+          </Link>
+          <button
+            type="button"
+            onClick={() => {
+              onAction?.();
+              void signOut();
+            }}
+            className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              isOverDarkHero
+                ? 'text-[#FAF7F2]/90 hover:text-white hover:bg-white/10'
+                : 'text-[#B91C1C] hover:bg-[#B91C1C]/8'
+            }`}
+          >
+            Sign Out
+          </button>
+        </div>
+      );
+    }
+
     return (
       <>
         <ClerkLoading>

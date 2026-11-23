@@ -14,29 +14,26 @@ import { DishImage } from '../components/DishImage';
 
 type FilterOption = 'All Meals' | MealCategory;
 
-const CATEGORIES: FilterOption[] = [
-  'All Meals',
-  'Main Dishes & Meals',
-  'Soups & Swallow',
-];
-
 export function MenuPage() {
-  const { meals, siteSettings } = useMenu();
+  const { meals, categories: liveCategories, siteSettings } = useMenu();
   const [searchParams, setSearchParams] = useSearchParams();
+  const categoriesList: FilterOption[] = Array.from(
+    new Set(['All Meals', ...liveCategories, ...meals.map((m) => m.category).filter(Boolean)])
+  );
   const initialParam = searchParams.get('category') as FilterOption | null;
 
   const [selectedCategory, setSelectedCategory] = useState<FilterOption>(
-    initialParam && CATEGORIES.includes(initialParam) ? initialParam : 'All Meals'
+    initialParam && categoriesList.includes(initialParam) ? initialParam : 'All Meals'
   );
 
   useEffect(() => {
     const param = searchParams.get('category') as FilterOption | null;
-    if (param && CATEGORIES.includes(param)) {
+    if (param && categoriesList.includes(param)) {
       setSelectedCategory(param);
     } else if (!param) {
       setSelectedCategory('All Meals');
     }
-  }, [searchParams]);
+  }, [searchParams, liveCategories, meals]);
 
   const handleCategoryChange = (category: FilterOption) => {
     setSelectedCategory(category);
@@ -76,7 +73,7 @@ export function MenuPage() {
               aria-label="Filter menu by category"
               className="flex flex-wrap items-center gap-2"
             >
-              {CATEGORIES.map((category) => {
+              {categoriesList.map((category) => {
                 const count =
                   category === 'All Meals'
                     ? meals.length

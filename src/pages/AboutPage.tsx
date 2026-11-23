@@ -89,14 +89,14 @@ export function AboutPage() {
               <div className="grid grid-cols-2 gap-4 h-full">
                 <div className="aspect-[4/3] rounded-xl overflow-hidden bg-[#EBE3D5]">
                   <DishImage
-                    src="/src/assets/images/dish_black_soup.jpg"
-                    alt="Traditional dark Edo Black Soup served with swallow"
+                    src="/src/assets/images/dish_pounded_yam_egusi.jpg"
+                    alt="Nigerian Pounded Yam served with Egusi soup and assorted meats"
                     className="w-full h-full object-cover"
                   />
                 </div>
                 <div className="aspect-[4/3] rounded-xl overflow-hidden bg-[#EBE3D5]">
                   <DishImage
-                    src="/src/assets/images/dish_beans_plantain.jpg"
+                    src="/src/assets/images/dish_beans_fried_plantain.jpg"
                     alt="Nigerian stewed beans and fried ripe plantain"
                     className="w-full h-full object-cover"
                   />

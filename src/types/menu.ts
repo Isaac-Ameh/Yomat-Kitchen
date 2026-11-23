@@ -1,4 +1,4 @@
-export type MealCategory = 'Main Dishes & Meals' | 'Soups & Swallow';
+export type MealCategory = string;
 
 export interface Meal {
   id: string;

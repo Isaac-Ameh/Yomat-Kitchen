@@ -5,20 +5,33 @@ import { GoogleGenAI } from '@google/genai';
 import { clerkMiddleware, createClerkClient } from '@clerk/express';
 import {
   type AuthenticatedRequest,
+  ROLE_PERMISSIONS,
   createRequireAuthenticatedSession,
+  getConfiguredAdminPasscode,
   getOwnerEmails,
   getPaystackSecretKey,
+  getPrimaryAdminProfileSummary,
   getServerClerkKeys,
+  hashPortalPasscode,
   isManagerRole,
   isOwnerInitialized,
   isOwnerProvisioningConfigured,
+  isPortalAdminCredentialReady,
   isResourceOwner,
   isServerClerkConfigured,
   isServerPaystackConfigured,
+  issuePortalSessionToken,
+  loadPrimaryAdminCredential,
+  portalStaffAccounts,
+  portalStaffInvitations,
   recentAuditLogs,
   recordAuthAuditEvent,
   requirePermission,
   requireRole,
+  revokedPortalUsers,
+  savePrimaryAdminCredential,
+  verifyPlaintextSecretTimingSafe,
+  verifyPortalPasscode,
 } from './authorization.ts';
 import {
   INITIAL_SERVER_MEALS,
@@ -109,7 +122,7 @@ const DEFAULT_WEBSITE_SETTINGS: WebsiteSettings = {
   welcomeBody:
     'Located Behind Science Laboratory Technology, University of Benin, Uselu, Benin City, Edo State, Nigeria, Yomat Kitchen brings comforting West African cuisine close to students, staff, families, and neighbours.',
   menuNotice:
-    'Sample demonstration menu shown for preview only. Call or chat via 0807 144 1727 to confirm Yomat Kitchen’s official dishes and pricing.',
+    'Prices shown in Nigerian Naira (₦). Order directly online via Paystack or reach us on WhatsApp / phone at 0807 144 1727.',
 };
 
 function isSafeImagePath(value: string): boolean {
@@ -288,40 +301,217 @@ export function createApiApp(): express.Express {
     );
   }
 
+  interface NotificationRecord {
+    id: string;
+    title: string;
+    message: string;
+    type: string;
+    is_read: boolean;
+    created_at: string;
+  }
+
   const userCarts = new Map<string, UserCartRecord>();
   const ordersByReference = new Map<string, OrderRecord>();
   let liveSettings: WebsiteSettings = { ...DEFAULT_WEBSITE_SETTINGS };
   const liveCategories: Array<{ id: string; name: string; sort_order: number }> = [
-    { id: 'main-dishes-and-meals', name: 'Main Dishes & Meals', sort_order: 1 },
-    { id: 'soups-and-swallow', name: 'Soups & Swallow', sort_order: 2 },
+    { id: 'rice-dishes', name: 'Rice Dishes', sort_order: 1 },
+    { id: 'swallows-and-soups', name: 'Swallows & Soups', sort_order: 2 },
+    { id: 'other-specials', name: 'Other Specials', sort_order: 3 },
   ];
   const cateringEnquiries: CateringEnquiry[] = [];
+  const liveNotifications: NotificationRecord[] = [];
+
+  async function pushNotification(params: {
+    title: string;
+    message: string;
+    type: string;
+  }): Promise<void> {
+    const entry: NotificationRecord = {
+      id: `notif-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      title: params.title,
+      message: params.message,
+      type: params.type,
+      is_read: false,
+      created_at: new Date().toISOString(),
+    };
+    liveNotifications.unshift(entry);
+    if (liveNotifications.length > 50) {
+      liveNotifications.length = 50;
+    }
+
+    const supabase = getSupabaseAdmin();
+    if (supabase) {
+      try {
+        await supabase.from('notifications').insert({
+          title: params.title,
+          message: params.message,
+          type: params.type,
+        });
+      } catch {
+        // Retain in-memory notification
+      }
+    }
+  }
+
+  async function ensureCategoryInSupabase(
+    supabase: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
+    categoryName: string,
+    sortOrder = 10
+  ): Promise<void> {
+    const clean = categoryName.trim().slice(0, 60) || 'Rice Dishes';
+    const slug =
+      clean
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '') || 'category';
+    try {
+      await supabase
+        .from('categories')
+        .upsert({ id: slug, name: clean, sort_order: sortOrder }, { onConflict: 'name', ignoreDuplicates: true });
+    } catch {
+      // Ignore duplicate / schema sync issues
+    }
+  }
+
+  async function ensureMealInSupabase(
+    supabase: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
+    meal: ServerMealInfo
+  ): Promise<void> {
+    await ensureCategoryInSupabase(supabase, meal.category);
+    try {
+      await supabase.from('menu_items').upsert(
+        {
+          id: meal.id,
+          name: meal.name,
+          category: meal.category,
+          short_description: meal.shortDescription,
+          full_description: meal.fullDescription,
+          ingredients_highlight: [],
+          prep_style: meal.prepStyle,
+          price_naira: meal.priceNaira,
+          image: meal.image,
+          is_available: meal.isAvailable,
+          is_featured: meal.isFeatured,
+        },
+        { onConflict: 'id', ignoreDuplicates: true }
+      );
+    } catch {
+      // Ignore duplicate / schema sync issues
+    }
+  }
+
+  let catalogAlignmentPromise: Promise<void> | null = null;
+  const STALE_TIMESTAMP_IMAGE_RE = /^\/src\/assets\/images\/.*_[0-9]{13}\.(jpg|jpeg|png|webp)$/i;
+  const SOUP_NAME_UPGRADES: Record<string, string> = {
+    'Eba & Afang': 'Eba & Afang Soup',
+    'Eba & Egusi': 'Eba & Egusi Soup',
+    'Eba & Okra': 'Eba & Okra Soup',
+    'Semo & Ogbono': 'Semo & Ogbono Soup',
+  };
+
+  async function ensureCatalogAlignedInSupabase(
+    supabase: NonNullable<ReturnType<typeof getSupabaseAdmin>>
+  ): Promise<void> {
+    if (catalogAlignmentPromise) {
+      return catalogAlignmentPromise;
+    }
+
+    catalogAlignmentPromise = (async () => {
+      try {
+        for (const cat of liveCategories) {
+          await ensureCategoryInSupabase(supabase, cat.name, cat.sort_order);
+        }
+
+        const { data: existingRows } = await supabase.from('menu_items').select('*');
+        const byId = new Map<string, Record<string, unknown>>(
+          (existingRows || []).map((row: Record<string, unknown>) => [String(row.id), row])
+        );
+
+        for (const meal of INITIAL_SERVER_MEALS) {
+          const existingRow = byId.get(meal.id);
+          if (!existingRow) {
+            await ensureCategoryInSupabase(supabase, meal.category);
+            await supabase.from('menu_items').upsert({
+              id: meal.id,
+              name: meal.name,
+              category: meal.category,
+              short_description: meal.shortDescription,
+              full_description: meal.fullDescription,
+              ingredients_highlight: [],
+              prep_style: meal.prepStyle,
+              price_naira: meal.priceNaira,
+              image: meal.image,
+              is_available: meal.isAvailable,
+              is_featured: meal.isFeatured,
+            });
+            continue;
+          }
+
+          const updates: Record<string, unknown> = {};
+          const dbImage = typeof existingRow.image === 'string' ? existingRow.image.trim() : '';
+          if (!dbImage || STALE_TIMESTAMP_IMAGE_RE.test(dbImage)) {
+            updates.image = meal.image;
+          }
+          const dbPrice = Number(existingRow.price_naira ?? 0);
+          if (!Number.isFinite(dbPrice) || dbPrice <= 0) {
+            updates.price_naira = meal.priceNaira;
+          }
+          const dbName = typeof existingRow.name === 'string' ? existingRow.name.trim() : '';
+          if (SOUP_NAME_UPGRADES[dbName]) {
+            updates.name = SOUP_NAME_UPGRADES[dbName];
+          }
+          if (Object.keys(updates).length > 0) {
+            updates.updated_at = new Date().toISOString();
+            await supabase.from('menu_items').update(updates).eq('id', meal.id);
+          }
+        }
+      } catch (err) {
+        console.error('Catalog alignment warning:', err);
+        catalogAlignmentPromise = null;
+      }
+    })();
+
+    return catalogAlignmentPromise;
+  }
 
   async function syncCatalogWithDatabase(): Promise<ServerMealInfo[]> {
     const supabase = getSupabaseAdmin();
     if (supabase) {
       try {
+        await ensureCatalogAlignedInSupabase(supabase);
         const { data } = await supabase.from('menu_items').select('*').order('name');
         if (Array.isArray(data) && data.length > 0) {
           for (const row of data) {
             const existing = liveMealCatalog.get(row.id);
             const numericPrice = Number(row.price_naira ?? 0);
+            const fallbackPrice = existing?.priceNaira ?? 0;
+            const resolvedPrice =
+              Number.isFinite(numericPrice) && numericPrice > 0 ? numericPrice : fallbackPrice;
+            const resolvedCategory =
+              typeof row.category === 'string' && row.category.trim()
+                ? row.category.trim()
+                : existing?.category || 'Rice Dishes';
+            const rawImage = typeof row.image === 'string' ? row.image.trim() : '';
+            const resolvedImage =
+              rawImage && !STALE_TIMESTAMP_IMAGE_RE.test(rawImage)
+                ? rawImage
+                : existing?.image || '/src/assets/images/dish_jollof_chicken.jpg';
+            const rawName = typeof row.name === 'string' ? row.name.trim() : '';
+            const resolvedName = SOUP_NAME_UPGRADES[rawName] || rawName || existing?.name || row.id;
+
             liveMealCatalog.set(row.id, {
               id: row.id,
-              name: row.name,
-              category:
-                row.category === 'Soups & Swallow'
-                  ? 'Soups & Swallow'
-                  : 'Main Dishes & Meals',
+              name: resolvedName,
+              category: resolvedCategory,
               shortDescription: row.short_description || existing?.shortDescription || '',
               fullDescription: row.full_description || existing?.fullDescription || '',
               prepStyle: row.prep_style || existing?.prepStyle || 'Nigerian Dish',
-              priceNaira: Number.isFinite(numericPrice) ? numericPrice : 0,
-              priceConfirmed: Number.isFinite(numericPrice) && numericPrice > 0,
-              image: row.image || existing?.image || '/src/assets/images/dish_jollof_chicken.jpg',
-              imageAlt: existing?.imageAlt || row.name,
+              priceNaira: resolvedPrice,
+              priceConfirmed: resolvedPrice > 0,
+              image: resolvedImage,
+              imageAlt: existing?.imageAlt || resolvedName,
               isAvailable: row.is_available ?? true,
-              isFeatured: row.is_featured ?? false,
+              isFeatured: row.is_featured ?? existing?.isFeatured ?? false,
             });
           }
         }
@@ -389,18 +579,246 @@ export function createApiApp(): express.Express {
 
   app.get('/api/health', async (_req, res) => {
     const initialized = await isOwnerInitialized();
+    const portalReady = await isPortalAdminCredentialReady();
     res.json({
       status: 'ok',
       clerkConfigured: isServerClerkConfigured(),
       paystackConfigured: isServerPaystackConfigured(),
       ownerInitialized: initialized,
       databaseConfigured: isSupabaseConfigured(),
+      portalReady,
     });
   });
 
-  // Public Menu Catalogue endpoint (merges live Manager-approved prices & availability)
+  // Standalone Portal Authentication Routes (active when Clerk SSO is not configured)
+  app.get('/api/auth/admin/status', async (_req, res) => {
+    const clerkConfigured = isServerClerkConfigured();
+    const passcodeEnvConfigured = getConfiguredAdminPasscode().length > 0;
+    const credentialReady = await isPortalAdminCredentialReady();
+    res.json({
+      clerkConfigured,
+      passcodeEnvConfigured,
+      setupRequired: !clerkConfigured && !credentialReady,
+      staffCount: portalStaffAccounts.size,
+    });
+  });
+
+  app.post('/api/auth/admin/setup', async (req, res) => {
+    if (isServerClerkConfigured()) {
+      res.status(400).json({ error: 'Clerk authentication is active; sign in with Clerk instead.' });
+      return;
+    }
+
+    if (await isPortalAdminCredentialReady()) {
+      res.status(403).json({
+        error: 'Initial admin passcode has already been claimed. Please sign in instead.',
+      });
+      return;
+    }
+
+    const fullName =
+      typeof req.body?.fullName === 'string' && req.body.fullName.trim()
+        ? req.body.fullName.trim().slice(0, 80)
+        : 'Yomat Kitchen Manager';
+    const email =
+      typeof req.body?.email === 'string' && req.body.email.includes('@')
+        ? req.body.email.trim().toLowerCase().slice(0, 120)
+        : 'manager@yomatkitchen.ng';
+    const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
+
+    if (passcode.length < 8) {
+      res.status(400).json({ error: 'Choose an admin passcode of at least 8 characters.' });
+      return;
+    }
+
+    const { salt, hash } = hashPortalPasscode(passcode);
+    const cred = {
+      id: 'portal-owner',
+      email,
+      fullName,
+      role: 'owner' as const,
+      salt,
+      hash,
+      createdAt: new Date().toISOString(),
+    };
+    await savePrimaryAdminCredential(cred);
+
+    const { token, expiresAt } = issuePortalSessionToken({
+      userId: cred.id,
+      email: cred.email,
+      fullName: cred.fullName,
+      role: 'owner',
+    });
+
+    recordAuthAuditEvent({
+      timestamp: new Date().toISOString(),
+      actorUserId: cred.id,
+      actorRole: 'owner',
+      action: 'POST',
+      target: '/api/auth/admin/setup',
+      outcome: 'allowed',
+      reason: 'first_run_manager_setup_claimed',
+    });
+
+    res.status(201).json({
+      token,
+      expiresAt,
+      user: {
+        userId: cred.id,
+        fullName: cred.fullName,
+        email: cred.email,
+      },
+      role: 'owner',
+      permissions: ROLE_PERMISSIONS.owner,
+      canAccessAdmin: true,
+    });
+  });
+
+  app.post('/api/auth/admin/login', async (req, res) => {
+    const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
+    const rawEmail = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const clerkActive = isServerClerkConfigured();
+    const envPasscode = getConfiguredAdminPasscode();
+
+    if (clerkActive && !envPasscode) {
+      res.status(400).json({ error: 'Clerk authentication is active; sign in with Clerk instead.' });
+      return;
+    }
+
+    if (!passcode) {
+      res.status(400).json({ error: 'Passcode is required.' });
+      return;
+    }
+
+    // 1. Check specific staff/manager team account if email was provided (standalone mode only)
+    if (!clerkActive && rawEmail) {
+      const staffMatch = Array.from(portalStaffAccounts.values()).find(
+        (s) => s.email === rawEmail && !revokedPortalUsers.has(s.id)
+      );
+      if (staffMatch && verifyPortalPasscode(passcode, staffMatch.salt, staffMatch.hash)) {
+        const effectiveRole =
+          staffMatch.role === 'owner' || staffMatch.role === 'manager' || staffMatch.role === 'staff'
+            ? staffMatch.role
+            : 'customer';
+        if (effectiveRole === 'customer') {
+          res.status(403).json({ error: 'Portal access for this account has been revoked.' });
+          return;
+        }
+        const { token, expiresAt } = issuePortalSessionToken({
+          userId: staffMatch.id,
+          email: staffMatch.email,
+          fullName: staffMatch.fullName,
+          role: effectiveRole,
+        });
+        recordAuthAuditEvent({
+          timestamp: new Date().toISOString(),
+          actorUserId: staffMatch.id,
+          actorRole: effectiveRole,
+          action: 'POST',
+          target: '/api/auth/admin/login',
+          outcome: 'allowed',
+          reason: `portal_team_login:${staffMatch.email}`,
+        });
+        res.json({
+          token,
+          expiresAt,
+          user: {
+            userId: staffMatch.id,
+            fullName: staffMatch.fullName,
+            email: staffMatch.email,
+          },
+          role: effectiveRole,
+          permissions: ROLE_PERMISSIONS[effectiveRole],
+          canAccessAdmin: true,
+        });
+        return;
+      }
+    }
+
+    // 2. Check configured ADMIN_PASSCODE env var (always takes precedence)
+    const primaryCred = clerkActive ? null : await loadPrimaryAdminCredential();
+    let ownerMatched = false;
+
+    if (envPasscode) {
+      ownerMatched = verifyPlaintextSecretTimingSafe(passcode, envPasscode);
+    } else if (primaryCred) {
+      ownerMatched =
+        (!rawEmail || rawEmail === primaryCred.email) &&
+        verifyPortalPasscode(passcode, primaryCred.salt, primaryCred.hash);
+    }
+
+    if (ownerMatched) {
+      const summary = getPrimaryAdminProfileSummary();
+      const { token, expiresAt } = issuePortalSessionToken({
+        userId: summary.id,
+        email: summary.email,
+        fullName: summary.full_name || 'Yomat Kitchen Manager',
+        role: 'owner',
+      });
+      recordAuthAuditEvent({
+        timestamp: new Date().toISOString(),
+        actorUserId: summary.id,
+        actorRole: 'owner',
+        action: 'POST',
+        target: '/api/auth/admin/login',
+        outcome: 'allowed',
+        reason: 'portal_manager_login',
+      });
+      res.json({
+        token,
+        expiresAt,
+        user: {
+          userId: summary.id,
+          fullName: summary.full_name || 'Yomat Kitchen Manager',
+          email: summary.email,
+        },
+        role: 'owner',
+        permissions: ROLE_PERMISSIONS.owner,
+        canAccessAdmin: true,
+      });
+      return;
+    }
+
+    recordAuthAuditEvent({
+      timestamp: new Date().toISOString(),
+      actorUserId: rawEmail || 'anonymous',
+      actorRole: 'customer',
+      action: 'POST',
+      target: '/api/auth/admin/login',
+      outcome: 'denied',
+      reason: 'invalid_portal_passcode',
+    });
+    res.status(401).json({ error: 'Invalid email or portal passcode.' });
+  });
+
+  app.post('/api/auth/admin/logout', requireAuthenticatedSession, (req: AuthenticatedRequest, res) => {
+    recordAuthAuditEvent({
+      timestamp: new Date().toISOString(),
+      actorUserId: req.appAuth!.userId,
+      actorRole: req.appAuth!.policy.role,
+      action: 'POST',
+      target: '/api/auth/admin/logout',
+      outcome: 'allowed',
+      reason: 'portal_logout',
+    });
+    res.json({ success: true });
+  });
+
+  // Public Menu Catalogue endpoint (merges live Manager-approved prices, availability & categories)
   app.get('/api/menu', async (_req, res) => {
     const meals = await syncCatalogWithDatabase();
+    let publicCategories = [...liveCategories];
+    const supabase = getSupabaseAdmin();
+    if (supabase) {
+      try {
+        const { data } = await supabase.from('categories').select('*').order('sort_order');
+        if (Array.isArray(data) && data.length > 0) {
+          publicCategories = data;
+        }
+      } catch {
+        // Fallback to liveCategories
+      }
+    }
     res.json({
       meals: meals.map((m) => ({
         id: m.id,
@@ -415,6 +833,7 @@ export function createApiApp(): express.Express {
         isAvailable: m.isAvailable,
         featured: m.isFeatured,
       })),
+      categories: publicCategories,
     });
   });
 
@@ -461,84 +880,71 @@ export function createApiApp(): express.Express {
     };
     await saveCateringList([record, ...existing]);
 
-    const supabase = getSupabaseAdmin();
-    if (supabase) {
-      void supabase.from('notifications').insert({
-        title: 'New Catering Enquiry',
-        message: `${clientName} (${guestCount} guests) requested ${eventType}.`,
-        type: 'catering',
-      });
-    }
+    await pushNotification({
+      title: 'New Catering Enquiry',
+      message: `${clientName} (${guestCount} guests) requested ${eventType}.`,
+      type: 'catering',
+    });
 
     res.status(201).json({ success: true, enquiry: record });
   });
 
-  app.get('/api/admin/system-diagnostic', async (_req, res) => {
-    const supabase = getSupabaseAdmin();
-    const supabaseConfigured = isSupabaseConfigured();
-    
-    let dbConnected = false;
-    let ownerExists = false;
-    let ownerCount = 0;
-    let targetUserProfile: unknown = null;
-    let migrationApplied = false;
-    let dbError: string | null = null;
+  app.get(
+    '/api/admin/system-diagnostic',
+    requireAuthenticatedSession,
+    requireRole('owner', 'manager'),
+    requirePermission('audit:read'),
+    async (_req, res) => {
+      const supabase = getSupabaseAdmin();
+      const supabaseConfigured = isSupabaseConfigured();
 
-    if (supabase) {
-      try {
-        const { count, error: countError } = await supabase
-          .from('profiles')
-          .select('*', { count: 'exact', head: true })
-          .eq('role', 'owner');
+      let dbConnected = false;
+      let ownerExists = false;
+      let ownerCount = 0;
+      let migrationApplied = false;
+      let dbError: string | null = null;
 
-        if (countError) {
-          dbError = countError.message;
-        } else {
-          dbConnected = true;
-          migrationApplied = true;
-          ownerCount = count ?? 0;
-          ownerExists = ownerCount > 0;
+      if (supabase) {
+        try {
+          const { count, error: countError } = await supabase
+            .from('profiles')
+            .select('*', { count: 'exact', head: true })
+            .eq('role', 'owner');
+
+          if (countError) {
+            dbError = countError.message;
+          } else {
+            dbConnected = true;
+            migrationApplied = true;
+            ownerCount = count ?? 0;
+            ownerExists = ownerCount > 0;
+          }
+        } catch (err) {
+          dbError = err instanceof Error ? err.message : String(err);
         }
-
-        const { data: targetProfile, error: profileError } = await supabase
-          .from('profiles')
-          .select('*')
-          .eq('id', 'user_3MO1hRh9claBMXmUlxErDtfNwDE')
-          .maybeSingle();
-
-        if (!profileError) {
-          targetUserProfile = targetProfile;
-        }
-      } catch (err) {
-        dbError = err instanceof Error ? err.message : String(err);
       }
-    }
 
-    const bootstrapTokenConfigured = Boolean(
-      process.env.EASI_MARK_BOOTSTRAP_TOKEN || ''
-    );
-    const bootstrapActive = !ownerExists;
+      const bootstrapTokenConfigured = Boolean(process.env.EASI_MARK_BOOTSTRAP_TOKEN || '');
+      const bootstrapActive = !ownerExists;
 
-    res.json({
-      supabaseConfigured,
-      databaseConnected: dbConnected,
-      migrationApplied,
-      ownerProfileExists: ownerExists,
-      ownerCount,
-      targetUser: {
-        userId: 'user_3MO1hRh9claBMXmUlxErDtfNwDE',
+      res.json({
+        supabaseConfigured,
+        databaseConnected: dbConnected,
+        migrationApplied,
+        ownerProfileExists: ownerExists,
+        ownerCount,
+        clerkConfigured: isServerClerkConfigured(),
+        portalCredentialReady: await isPortalAdminCredentialReady(),
         ownerEmailConfigured: getOwnerEmails().length > 0,
-        profileFound: Boolean(targetUserProfile),
-        profileData: targetUserProfile,
-      },
-      bootstrap: {
-        mechanismActive: bootstrapActive,
-        tokenConfigured: bootstrapTokenConfigured,
-      },
-      databaseError: dbError,
-      status: dbConnected && migrationApplied ? 'PASS' : 'BLOCKED',
-    });
-  });
+        bootstrap: {
+          mechanismActive: bootstrapActive,
+          tokenConfigured: bootstrapTokenConfigured,
+        },
+        databaseError: dbError,
+        status: dbConnected && migrationApplied ? 'PASS' : 'IN_MEMORY_FALLBACK',
+      });
+    }
+  );
 
   app.get('/api/config', (_req, res) => {
     res.json({
@@ -555,8 +961,26 @@ export function createApiApp(): express.Express {
     async (req: AuthenticatedRequest, res) => {
       try {
         const appAuth = req.appAuth!;
-        if (!serverClerkClient) {
-          res.status(503).json({ error: 'Authentication client unavailable.' });
+        const isPortalUser =
+          appAuth.userId.startsWith('portal-') || appAuth.userId.startsWith('staff-');
+        if (!serverClerkClient || isPortalUser) {
+          res.json({
+            identity: {
+              userId: appAuth.userId,
+              firstName: appAuth.fullName?.split(' ')[0] || null,
+              lastName: appAuth.fullName?.split(' ').slice(1).join(' ') || null,
+              fullName: appAuth.fullName,
+              email: appAuth.verifiedEmail,
+              imageUrl: null,
+              orgId: appAuth.orgId,
+            },
+            authorization: {
+              role: appAuth.policy.role,
+              permissions: appAuth.policy.permissions,
+              canAccessAdmin: appAuth.policy.permissions.includes('admin:access'),
+              ownerInitialized: await isOwnerInitialized(),
+            },
+          });
           return;
         }
         const user = await serverClerkClient.users.getUser(appAuth.userId);
@@ -564,6 +988,7 @@ export function createApiApp(): express.Express {
           user.emailAddresses.find((e) => e.id === user.primaryEmailAddressId)
             ?.emailAddress ??
           user.emailAddresses[0]?.emailAddress ??
+          appAuth.verifiedEmail ??
           null;
 
         res.json({
@@ -584,7 +1009,7 @@ export function createApiApp(): express.Express {
           },
         });
       } catch (error) {
-        console.error('Failed to retrieve Clerk user identity:', error);
+        console.error('Failed to retrieve user identity:', error);
         res.status(500).json({ error: 'Unable to retrieve authenticated user profile.' });
       }
     }
@@ -742,12 +1167,8 @@ export function createApiApp(): express.Express {
         return;
       }
 
-      if (!serverClerkClient) {
-        res.status(503).json({ error: 'Authentication client unavailable.' });
-        return;
-      }
-
       try {
+        await syncCatalogWithDatabase();
         const userId = req.appAuth!.userId;
         let cartItems: StoredCartEntry[] | undefined;
 
@@ -774,7 +1195,7 @@ export function createApiApp(): express.Express {
 
         const built = buildLineItems(cartItems);
         if (!built) {
-          res.status(400).json({ error: 'Unknown meal in cart.' });
+          res.status(400).json({ error: 'Unknown meal or unpriced item in cart.' });
           return;
         }
 
@@ -787,12 +1208,20 @@ export function createApiApp(): express.Express {
           return;
         }
 
-        const user = await serverClerkClient.users.getUser(userId);
-        const primaryEmail =
-          user.emailAddresses.find((e) => e.id === user.primaryEmailAddressId)
-            ?.emailAddress ??
-          user.emailAddresses[0]?.emailAddress ??
-          null;
+        let primaryEmail = req.appAuth!.verifiedEmail;
+        const isPortalUser = userId.startsWith('portal-') || userId.startsWith('staff-');
+        if (!primaryEmail && serverClerkClient && !isPortalUser) {
+          try {
+            const user = await serverClerkClient.users.getUser(userId);
+            primaryEmail =
+              user.emailAddresses.find((e) => e.id === user.primaryEmailAddressId)
+                ?.emailAddress ??
+              user.emailAddresses[0]?.emailAddress ??
+              null;
+          } catch (clerkErr) {
+            console.warn('Clerk email lookup fallback:', clerkErr);
+          }
+        }
 
         if (!primaryEmail) {
           res.status(400).json({
@@ -874,7 +1303,23 @@ export function createApiApp(): express.Express {
 
         const supabase = getSupabaseAdmin();
         if (supabase) {
-          await supabase.from('orders').upsert({
+          const mappedRole =
+            req.appAuth!.policy.role === 'manager' ? 'owner' : req.appAuth!.policy.role;
+          const { error: profileError } = await supabase.from('profiles').upsert(
+            {
+              id: userId,
+              email: primaryEmail,
+              full_name: req.appAuth!.fullName,
+              role: mappedRole,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'id', ignoreDuplicates: true }
+          );
+          if (profileError) {
+            console.error('Supabase profile upsert warning:', profileError);
+          }
+
+          const { error: orderError } = await supabase.from('orders').upsert({
             reference,
             owner_id: userId,
             email: primaryEmail,
@@ -882,9 +1327,20 @@ export function createApiApp(): express.Express {
             expected_amount_kobo: expectedAmountKobo,
             status: 'pending',
             payment_status: 'pending',
+            channel: 'paystack',
           });
+          if (orderError) {
+            console.error('Supabase order insert failed:', orderError);
+            res.status(500).json({ error: 'Unable to record order before payment.' });
+            return;
+          }
+
           for (const item of lineItems) {
-            await supabase.from('order_items').insert({
+            const catalogMeal = getCatalogMeal(item.mealId);
+            if (catalogMeal) {
+              await ensureMealInSupabase(supabase, catalogMeal);
+            }
+            const { error: itemError } = await supabase.from('order_items').insert({
               order_reference: reference,
               meal_id: item.mealId,
               name: item.name,
@@ -892,6 +1348,9 @@ export function createApiApp(): express.Express {
               quantity: item.quantity,
               line_total_naira: item.lineTotalNaira,
             });
+            if (itemError) {
+              console.error('Supabase order_items insert failed:', itemError);
+            }
           }
         }
 
@@ -989,6 +1448,7 @@ export function createApiApp(): express.Express {
       }
 
       try {
+        await syncCatalogWithDatabase();
         const paystackSecret = getPaystackSecretKey();
         const verifyRes = await fetch(
           `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
@@ -1010,6 +1470,9 @@ export function createApiApp(): express.Express {
             reference?: string;
             paid_at?: string;
             channel?: string;
+            customer?: {
+              email?: string;
+            };
             metadata?: {
               userId?: string;
               expectedAmountKobo?: number;
@@ -1038,6 +1501,7 @@ export function createApiApp(): express.Express {
         }
 
         let order = existingOrder;
+        let reconstructedFromMetadata = false;
         if (!order) {
           const meta = tx.metadata;
           const metaItems = sanitizeCartItems(meta?.items);
@@ -1080,7 +1544,7 @@ export function createApiApp(): express.Express {
           order = {
             reference,
             ownerId: metaUserId,
-            email: '',
+            email: tx.customer?.email || req.appAuth!.verifiedEmail || '',
             items: rebuilt.lineItems,
             totalNaira: rebuilt.totalNaira,
             expectedAmountKobo: rebuilt.expectedAmountKobo,
@@ -1089,6 +1553,7 @@ export function createApiApp(): express.Express {
             createdAt: new Date().toISOString(),
           };
           ordersByReference.set(reference, order);
+          reconstructedFromMetadata = true;
         }
 
         if (
@@ -1111,19 +1576,68 @@ export function createApiApp(): express.Express {
         order.channel = tx.channel || 'card';
         userCarts.delete(userId);
 
-        if (supabase) {
-          await supabase
-            .from('orders')
-            .update({
-              status: 'confirmed',
-              payment_status: 'paid',
-              channel: order.channel,
-              paid_at: order.paidAt,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('reference', reference);
+        await pushNotification({
+          title: 'New Paid Order',
+          message: `Order ${reference} paid successfully (${order.totalNaira} NGN).`,
+          type: 'order',
+        });
 
-          await supabase.from('payments').upsert({
+        if (supabase) {
+          if (reconstructedFromMetadata) {
+            const mappedRole =
+              req.appAuth!.policy.role === 'manager' ? 'owner' : req.appAuth!.policy.role;
+            await supabase.from('profiles').upsert(
+              {
+                id: order.ownerId,
+                email: order.email || `${order.ownerId}@yomatkitchen.ng`,
+                full_name: req.appAuth!.fullName,
+                role: mappedRole,
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: 'id', ignoreDuplicates: true }
+            );
+          }
+
+          const { error: orderUpdateError } = await supabase.from('orders').upsert({
+            reference: order.reference,
+            owner_id: order.ownerId,
+            email: order.email || req.appAuth!.verifiedEmail || `${order.ownerId}@yomatkitchen.ng`,
+            total_naira: order.totalNaira,
+            expected_amount_kobo: order.expectedAmountKobo,
+            status: 'confirmed',
+            payment_status: 'paid',
+            channel: order.channel,
+            paid_at: order.paidAt,
+            updated_at: new Date().toISOString(),
+          });
+          if (orderUpdateError) {
+            console.error('Supabase paid order upsert failed:', orderUpdateError);
+          }
+
+          if (reconstructedFromMetadata) {
+            const { count: existingItemsCount } = await supabase
+              .from('order_items')
+              .select('*', { count: 'exact', head: true })
+              .eq('order_reference', reference);
+            if ((existingItemsCount ?? 0) === 0) {
+              for (const item of order.items) {
+                const catalogMeal = getCatalogMeal(item.mealId);
+                if (catalogMeal) {
+                  await ensureMealInSupabase(supabase, catalogMeal);
+                }
+                await supabase.from('order_items').insert({
+                  order_reference: reference,
+                  meal_id: item.mealId,
+                  name: item.name,
+                  unit_price_naira: item.unitPriceNaira,
+                  quantity: item.quantity,
+                  line_total_naira: item.lineTotalNaira,
+                });
+              }
+            }
+          }
+
+          const { error: paymentUpsertError } = await supabase.from('payments').upsert({
             reference,
             provider: 'paystack',
             amount_kobo: tx.amount,
@@ -1131,12 +1645,9 @@ export function createApiApp(): express.Express {
             status: tx.status,
             raw_response: tx,
           });
-
-          await supabase.from('notifications').insert({
-            title: 'New Paid Order',
-            message: `Order ${reference} paid successfully (${order.totalNaira} NGN).`,
-            type: 'order',
-          });
+          if (paymentUpsertError) {
+            console.error('Supabase payment upsert failed:', paymentUpsertError);
+          }
         }
 
         res.json({
@@ -1272,6 +1783,22 @@ export function createApiApp(): express.Express {
           if (ord.status === 'completed') completedOrders++;
           if (ord.status === 'cancelled') cancelledOrders++;
         }
+        if (canSeeFinancials) {
+          const counts: Record<string, { name: string; count: number; revenue: number }> = {};
+          for (const ord of localOrders) {
+            for (const item of ord.items) {
+              if (!counts[item.mealId]) {
+                counts[item.mealId] = { name: item.name, count: 0, revenue: 0 };
+              }
+              counts[item.mealId].count += item.quantity;
+              counts[item.mealId].revenue += item.lineTotalNaira;
+            }
+          }
+          popularMeals = Object.entries(counts)
+            .map(([mealId, stats]) => ({ mealId, ...stats }))
+            .sort((a, b) => b.count - a.count)
+            .slice(0, 5);
+        }
       }
 
       res.json({
@@ -1304,25 +1831,27 @@ export function createApiApp(): express.Express {
       const supabase = getSupabaseAdmin();
       const statusFilter = typeof req.query.status === 'string' ? req.query.status : '';
       if (!supabase) {
-        let localOrders = Array.from(ordersByReference.values()).map((ord) => ({
-          reference: ord.reference,
-          owner_id: ord.ownerId,
-          email: ord.email,
-          total_naira: ord.totalNaira,
-          expected_amount_kobo: ord.expectedAmountKobo,
-          status: ord.status,
-          payment_status: ord.paymentStatus,
-          channel: ord.channel,
-          paid_at: ord.paidAt,
-          created_at: ord.createdAt,
-          order_items: ord.items.map((i) => ({
-            meal_id: i.mealId,
-            name: i.name,
-            unit_price_naira: i.unitPriceNaira,
-            quantity: i.quantity,
-            line_total_naira: i.lineTotalNaira,
-          })),
-        }));
+        let localOrders = Array.from(ordersByReference.values())
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          .map((ord) => ({
+            reference: ord.reference,
+            owner_id: ord.ownerId,
+            email: ord.email,
+            total_naira: ord.totalNaira,
+            expected_amount_kobo: ord.expectedAmountKobo,
+            status: ord.status,
+            payment_status: ord.paymentStatus,
+            channel: ord.channel,
+            paid_at: ord.paidAt,
+            created_at: ord.createdAt,
+            order_items: ord.items.map((i) => ({
+              meal_id: i.mealId,
+              name: i.name,
+              unit_price_naira: i.unitPriceNaira,
+              quantity: i.quantity,
+              line_total_naira: i.lineTotalNaira,
+            })),
+          }));
         if (statusFilter && statusFilter !== 'all') {
           localOrders = localOrders.filter((o) => o.status === statusFilter);
         }
@@ -1346,6 +1875,160 @@ export function createApiApp(): express.Express {
       }
 
       res.json({ orders: data || [], databaseConnected: true });
+    }
+  );
+
+  app.post(
+    '/api/admin/orders',
+    requireAuthenticatedSession,
+    requireRole('staff', 'owner', 'manager'),
+    requirePermission('orders:update'),
+    async (req: AuthenticatedRequest, res) => {
+      const body = req.body || {};
+      const customerContact =
+        typeof body.email === 'string' && body.email.trim()
+          ? body.email.trim().slice(0, 120)
+          : 'walkin@yomatkitchen.ng';
+      const channel =
+        typeof body.channel === 'string' && body.channel.trim()
+          ? body.channel.trim().slice(0, 40)
+          : 'whatsapp_phone';
+      const requestedStatus = body.status;
+      const allowedStatuses = new Set([
+        'pending',
+        'confirmed',
+        'preparing',
+        'ready',
+        'completed',
+        'cancelled',
+      ]);
+      const status: OrderRecord['status'] = allowedStatuses.has(requestedStatus)
+        ? requestedStatus
+        : 'confirmed';
+
+      // Staff cannot mark an order as paid manually; only Manager can record paid status
+      const paymentStatus: OrderRecord['paymentStatus'] =
+        body.paymentStatus === 'paid' && isManagerRole(req.appAuth?.policy.role)
+          ? 'paid'
+          : 'pending';
+
+      const rawItems = Array.isArray(body.items) ? body.items : [];
+      if (rawItems.length === 0) {
+        res.status(400).json({ error: 'Select at least one dish item for the order.' });
+        return;
+      }
+
+      const lineItems: OrderLineItem[] = [];
+      let totalNaira = 0;
+
+      for (const entry of rawItems) {
+        const mealId = typeof entry?.mealId === 'string' ? entry.mealId : '';
+        const qty = Math.max(1, Math.min(99, Math.round(Number(entry?.quantity) || 1)));
+        const meal = getCatalogMeal(mealId);
+        if (!meal) continue;
+        const unitPrice =
+          meal.priceConfirmed && meal.priceNaira > 0
+            ? meal.priceNaira
+            : Math.max(0, Math.round(Number(entry?.unitPriceNaira) || 0));
+        const lineTotal = unitPrice * qty;
+        totalNaira += lineTotal;
+        lineItems.push({
+          mealId: meal.id,
+          name: meal.name,
+          unitPriceNaira: unitPrice,
+          quantity: qty,
+          lineTotalNaira: lineTotal,
+        });
+      }
+
+      if (lineItems.length === 0) {
+        res.status(400).json({ error: 'No valid menu items provided for the order.' });
+        return;
+      }
+
+      const reference = `YMK-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+      const nowIso = new Date().toISOString();
+      const orderRecord: OrderRecord = {
+        reference,
+        ownerId: `customer-${customerContact.replace(/[^a-z0-9]/gi, '').slice(0, 24) || 'walkin'}`,
+        email: customerContact,
+        items: lineItems,
+        totalNaira,
+        expectedAmountKobo: totalNaira * 100,
+        status,
+        paymentStatus,
+        channel,
+        paidAt: paymentStatus === 'paid' ? nowIso : undefined,
+        createdAt: nowIso,
+      };
+      ordersByReference.set(reference, orderRecord);
+
+      const supabase = getSupabaseAdmin();
+      if (supabase) {
+        let effectiveOwnerId = orderRecord.ownerId;
+        const { error: guestProfileError } = await supabase.from('profiles').upsert(
+          {
+            id: effectiveOwnerId,
+            email: orderRecord.email,
+            full_name: customerContact,
+            role: 'customer',
+            updated_at: nowIso,
+          },
+          { onConflict: 'id', ignoreDuplicates: true }
+        );
+        if (guestProfileError) {
+          effectiveOwnerId = req.appAuth!.userId;
+        }
+        orderRecord.ownerId = effectiveOwnerId;
+
+        const { error: orderErr } = await supabase.from('orders').upsert({
+          reference: orderRecord.reference,
+          owner_id: effectiveOwnerId,
+          email: orderRecord.email,
+          total_naira: orderRecord.totalNaira,
+          expected_amount_kobo: orderRecord.expectedAmountKobo,
+          status: orderRecord.status,
+          payment_status: orderRecord.paymentStatus,
+          channel: orderRecord.channel,
+          paid_at: orderRecord.paidAt ?? null,
+        });
+        if (orderErr) {
+          res.status(400).json({ error: orderErr.message || 'Failed to save order to database.' });
+          return;
+        }
+        for (const item of lineItems) {
+          const catalogMeal = getCatalogMeal(item.mealId);
+          if (catalogMeal) {
+            await ensureMealInSupabase(supabase, catalogMeal);
+          }
+          await supabase.from('order_items').insert({
+            order_reference: reference,
+            meal_id: item.mealId,
+            name: item.name,
+            unit_price_naira: item.unitPriceNaira,
+            quantity: item.quantity,
+            line_total_naira: item.lineTotalNaira,
+          });
+        }
+      }
+
+      await pushNotification({
+        title: 'New Kitchen Order Recorded',
+        message: `${reference} (${channel}) — ${lineItems.length} item(s) for ${customerContact}.`,
+        type: 'order',
+      });
+
+      recordAuthAuditEvent({
+        timestamp: nowIso,
+        actorUserId: req.appAuth!.userId,
+        actorRole: req.appAuth!.policy.role,
+        action: 'POST',
+        target: '/api/admin/orders',
+        outcome: 'allowed',
+        reason: `created_order:${reference}`,
+      });
+
+      res.status(201).json({ success: true, order: orderRecord });
     }
   );
 
@@ -1387,7 +2070,12 @@ export function createApiApp(): express.Express {
           return;
         }
         if (status) localOrd.status = status;
-        if (paymentStatus) localOrd.paymentStatus = paymentStatus;
+        if (paymentStatus) {
+          localOrd.paymentStatus = paymentStatus;
+          if (paymentStatus === 'paid' && !localOrd.paidAt) {
+            localOrd.paidAt = new Date().toISOString();
+          }
+        }
 
         recordAuthAuditEvent({
           timestamp: new Date().toISOString(),
@@ -1405,7 +2093,12 @@ export function createApiApp(): express.Express {
 
       const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
       if (status) updates.status = status;
-      if (paymentStatus) updates.payment_status = paymentStatus;
+      if (paymentStatus) {
+        updates.payment_status = paymentStatus;
+        if (paymentStatus === 'paid') {
+          updates.paid_at = new Date().toISOString();
+        }
+      }
 
       const { data, error } = await supabase
         .from('orders')
@@ -1517,6 +2210,7 @@ export function createApiApp(): express.Express {
         updatedMeals.push(updated);
 
         if (supabase) {
+          await ensureCategoryInSupabase(supabase, updated.category);
           await supabase.from('menu_items').upsert({
             id: updated.id,
             name: updated.name,
@@ -1544,6 +2238,14 @@ export function createApiApp(): express.Express {
         reason: `approved_prices:${updatedMeals.map((m) => `${m.id}=${m.priceNaira}`).join(',')}`,
       });
 
+      if (updatedMeals.length > 0) {
+        await pushNotification({
+          title: 'Menu Prices Published',
+          message: `Approved ${updatedMeals.length} menu price(s) onto Our Menu.`,
+          type: 'menu',
+        });
+      }
+
       res.json({
         success: true,
         approvedCount: updatedMeals.length,
@@ -1565,7 +2267,9 @@ export function createApiApp(): express.Express {
           : `meal-${Date.now()}`;
       const name = typeof body.name === 'string' ? body.name.trim() : '';
       const category =
-        body.category === 'Soups & Swallow' ? 'Soups & Swallow' : 'Main Dishes & Meals';
+        typeof body.category === 'string' && body.category.trim()
+          ? body.category.trim().slice(0, 60)
+          : 'Rice Dishes';
       const shortDescription =
         typeof (body.shortDescription ?? body.short_description) === 'string'
           ? (body.shortDescription ?? body.short_description).trim()
@@ -1606,6 +2310,7 @@ export function createApiApp(): express.Express {
 
       const supabase = getSupabaseAdmin();
       if (supabase) {
+        await ensureCategoryInSupabase(supabase, newMeal.category);
         const { error } = await supabase.from('menu_items').upsert({
           id: newMeal.id,
           name: newMeal.name,
@@ -1662,10 +2367,8 @@ export function createApiApp(): express.Express {
           ...existing,
           name: body.name !== undefined ? String(body.name).trim() : existing.name,
           category:
-            body.category === 'Soups & Swallow'
-              ? 'Soups & Swallow'
-              : body.category === 'Main Dishes & Meals'
-              ? 'Main Dishes & Meals'
+            typeof body.category === 'string' && body.category.trim()
+              ? body.category.trim().slice(0, 60)
               : existing.category,
           shortDescription:
             body.shortDescription !== undefined
@@ -1689,6 +2392,9 @@ export function createApiApp(): express.Express {
       const supabase = getSupabaseAdmin();
       if (supabase) {
         const current = liveMealCatalog.get(mealId);
+        if (current) {
+          await ensureCategoryInSupabase(supabase, current.category);
+        }
         const updates: Record<string, unknown> = {
           updated_at: new Date().toISOString(),
           ...(current
@@ -1738,11 +2444,11 @@ export function createApiApp(): express.Express {
     requirePermission('menu:manage'),
     async (req: AuthenticatedRequest, res) => {
       const mealId = req.params.id;
-      const isCoreTen = INITIAL_SERVER_MEALS.some((m) => m.id === mealId);
-      if (isCoreTen) {
+      const isCoreMeal = INITIAL_SERVER_MEALS.some((m) => m.id === mealId);
+      if (isCoreMeal) {
         res.status(400).json({
           error:
-            'Core Yomat Kitchen demonstration menu dishes cannot be permanently deleted; mark the dish unavailable instead.',
+            'Core Yomat Kitchen menu dishes cannot be permanently deleted; mark the dish unavailable instead.',
         });
         return;
       }
@@ -1796,18 +2502,22 @@ export function createApiApp(): express.Express {
     requireRole('owner', 'manager'),
     requirePermission('categories:manage'),
     async (req: AuthenticatedRequest, res) => {
-      const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-      const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const name = typeof req.body?.name === 'string' ? req.body.name.trim().slice(0, 60) : '';
+      const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
       const image = req.body?.image || null;
 
-      if (!name) {
+      if (!name || !id) {
         res.status(400).json({ error: 'Category name is required.' });
         return;
       }
 
-      if (!liveCategories.some((c) => c.id === id)) {
-        liveCategories.push({ id, name, sort_order: liveCategories.length + 1 });
+      if (liveCategories.some((c) => c.id === id || c.name.toLowerCase() === name.toLowerCase())) {
+        res.status(400).json({ error: `Category "${name}" already exists.` });
+        return;
       }
+
+      const created = { id, name, sort_order: liveCategories.length + 1 };
+      liveCategories.push(created);
 
       const supabase = getSupabaseAdmin();
       if (supabase) {
@@ -1828,7 +2538,7 @@ export function createApiApp(): express.Express {
         reason: `created_category:${name}`,
       });
 
-      res.json({ success: true, category: { id, name } });
+      res.status(201).json({ success: true, category: created });
     }
   );
 
@@ -1839,9 +2549,6 @@ export function createApiApp(): express.Express {
     requirePermission('categories:manage'),
     async (req: AuthenticatedRequest, res) => {
       const catId = req.params.id;
-      const idx = liveCategories.findIndex((c) => c.id === catId);
-      if (idx !== -1) liveCategories.splice(idx, 1);
-
       const supabase = getSupabaseAdmin();
       if (supabase) {
         const { data: category } = await supabase
@@ -1869,7 +2576,34 @@ export function createApiApp(): express.Express {
           res.status(400).json({ error: error.message });
           return;
         }
+      } else {
+        const target = liveCategories.find((c) => c.id === catId);
+        if (!target) {
+          res.status(404).json({ error: 'Category not found.' });
+          return;
+        }
+        const usedCount = Array.from(liveMealCatalog.values()).filter(
+          (m) => m.category === target.name
+        ).length;
+        if (usedCount > 0) {
+          res.status(400).json({
+            error: `Cannot delete category "${target.name}" because it still contains ${usedCount} menu item(s).`,
+          });
+          return;
+        }
       }
+
+      const idx = liveCategories.findIndex((c) => c.id === catId);
+      if (idx !== -1) liveCategories.splice(idx, 1);
+
+      recordAuthAuditEvent({
+        timestamp: new Date().toISOString(),
+        actorUserId: req.appAuth!.userId,
+        actorRole: req.appAuth!.policy.role,
+        action: 'DELETE',
+        target: `/api/admin/categories/${catId}`,
+        outcome: 'allowed',
+      });
 
       res.json({ success: true });
     }
@@ -2208,7 +2942,24 @@ export function createApiApp(): express.Express {
     async (_req, res) => {
       const supabase = getSupabaseAdmin();
       if (!supabase) {
-        res.json({ staff: [], invitations: [], databaseConnected: false });
+        const primary = getPrimaryAdminProfileSummary();
+        const teamProfiles = [
+          primary,
+          ...Array.from(portalStaffAccounts.values())
+            .filter((s) => s.role !== 'customer' && !revokedPortalUsers.has(s.id))
+            .map((s) => ({
+              id: s.id,
+              email: s.email,
+              full_name: s.fullName,
+              role: s.role,
+              created_at: s.createdAt,
+            })),
+        ];
+        res.json({
+          staff: teamProfiles,
+          invitations: portalStaffInvitations.filter((i) => i.status === 'pending'),
+          databaseConnected: false,
+        });
         return;
       }
 
@@ -2237,7 +2988,13 @@ export function createApiApp(): express.Express {
     async (req: AuthenticatedRequest, res) => {
       const appAuth = req.appAuth!;
       const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
-      const role = req.body?.role === 'owner' || req.body?.role === 'manager' ? 'owner' : 'staff';
+      const fullName =
+        typeof req.body?.fullName === 'string' && req.body.fullName.trim()
+          ? req.body.fullName.trim().slice(0, 80)
+          : email.split('@')[0] || 'Team Member';
+      const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
+      const role: 'owner' | 'staff' =
+        req.body?.role === 'owner' || req.body?.role === 'manager' ? 'owner' : 'staff';
 
       if (!email || !email.includes('@')) {
         res.status(400).json({ error: 'Valid email address is required.' });
@@ -2246,20 +3003,77 @@ export function createApiApp(): express.Express {
 
       const supabase = getSupabaseAdmin();
       if (!supabase) {
-        res.status(503).json({ error: 'Supabase database is not configured.' });
+        if (passcode && passcode.length < 6) {
+          res.status(400).json({ error: 'Staff passcode must be at least 6 characters.' });
+          return;
+        }
+
+        if (passcode) {
+          const staffId = `staff-${crypto.randomBytes(4).toString('hex')}`;
+          const { salt, hash } = hashPortalPasscode(passcode);
+          portalStaffAccounts.set(staffId, {
+            id: staffId,
+            email,
+            fullName,
+            role,
+            salt,
+            hash,
+            createdAt: new Date().toISOString(),
+          });
+          recordAuthAuditEvent({
+            timestamp: new Date().toISOString(),
+            actorUserId: appAuth.userId,
+            actorRole: appAuth.policy.role,
+            action: 'POST',
+            target: '/api/admin/staff/invitations',
+            outcome: 'allowed',
+            reason: `created_portal_staff:${email},role:${role}`,
+          });
+          res.status(201).json({
+            success: true,
+            activated: true,
+            staffMember: { id: staffId, email, full_name: fullName, role },
+          });
+          return;
+        }
+
+        const invite = {
+          id: `inv-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+          email,
+          role,
+          status: 'pending' as const,
+          created_at: new Date().toISOString(),
+        };
+        portalStaffInvitations.unshift(invite);
+
+        recordAuthAuditEvent({
+          timestamp: new Date().toISOString(),
+          actorUserId: appAuth.userId,
+          actorRole: appAuth.policy.role,
+          action: 'POST',
+          target: '/api/admin/staff/invitations',
+          outcome: 'allowed',
+          reason: `invited:${email},role:${role}`,
+        });
+
+        res.status(201).json({ success: true, invitation: invite });
         return;
       }
 
       const token = crypto.randomBytes(24).toString('hex');
       const { data, error } = await supabase
         .from('staff_invitations')
-        .insert({
-          email,
-          role,
-          invited_by: appAuth.userId,
-          token,
-          status: 'pending',
-        })
+        .upsert(
+          {
+            email,
+            role,
+            invited_by: appAuth.userId,
+            token,
+            status: 'pending',
+            expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+          },
+          { onConflict: 'email' }
+        )
         .select()
         .single();
 
@@ -2304,9 +3118,45 @@ export function createApiApp(): express.Express {
         return;
       }
 
+      if (targetUserId === 'portal-owner' && mappedRole && mappedRole !== 'owner') {
+        res.status(400).json({ error: 'Primary portal owner role cannot be demoted.' });
+        return;
+      }
+
       const supabase = getSupabaseAdmin();
       if (!supabase) {
-        res.status(503).json({ error: 'Supabase database is not configured.' });
+        const staff = portalStaffAccounts.get(targetUserId);
+        if (!staff) {
+          res.status(404).json({ error: 'Staff member not found.' });
+          return;
+        }
+        if (mappedRole) {
+          staff.role = mappedRole;
+          if (mappedRole === 'customer') {
+            revokedPortalUsers.add(targetUserId);
+          } else {
+            revokedPortalUsers.delete(targetUserId);
+          }
+        }
+        recordAuthAuditEvent({
+          timestamp: new Date().toISOString(),
+          actorUserId: req.appAuth!.userId,
+          actorRole: req.appAuth!.policy.role,
+          action: 'PATCH',
+          target: `/api/admin/staff/${targetUserId}`,
+          outcome: 'allowed',
+          reason: `role:${mappedRole || 'unchanged'}`,
+        });
+        res.json({
+          success: true,
+          profile: {
+            id: staff.id,
+            email: staff.email,
+            full_name: staff.fullName,
+            role: staff.role,
+            created_at: staff.createdAt,
+          },
+        });
         return;
       }
 
@@ -2346,14 +3196,32 @@ export function createApiApp(): express.Express {
     requirePermission('staff:manage'),
     async (req: AuthenticatedRequest, res) => {
       const targetUserId = req.params.userId;
-      if (targetUserId === req.appAuth!.userId) {
+      if (targetUserId === req.appAuth!.userId || targetUserId === 'portal-owner') {
         res.status(400).json({ error: 'Manager cannot remove their own access.' });
         return;
       }
 
       const supabase = getSupabaseAdmin();
       if (!supabase) {
-        res.status(503).json({ error: 'Supabase database is not configured.' });
+        const staff = portalStaffAccounts.get(targetUserId);
+        if (staff) {
+          staff.role = 'customer';
+          revokedPortalUsers.add(targetUserId);
+        }
+        const invIdx = portalStaffInvitations.findIndex((i) => i.id === targetUserId);
+        if (invIdx !== -1) {
+          portalStaffInvitations.splice(invIdx, 1);
+        }
+        recordAuthAuditEvent({
+          timestamp: new Date().toISOString(),
+          actorUserId: req.appAuth!.userId,
+          actorRole: req.appAuth!.policy.role,
+          action: 'DELETE',
+          target: `/api/admin/staff/${targetUserId}`,
+          outcome: 'allowed',
+          reason: 'revoked_staff_access',
+        });
+        res.json({ success: true });
         return;
       }
 
@@ -2480,7 +3348,7 @@ export function createApiApp(): express.Express {
     async (_req, res) => {
       const supabase = getSupabaseAdmin();
       if (!supabase) {
-        res.json({ notifications: [], databaseConnected: false });
+        res.json({ notifications: liveNotifications, databaseConnected: false });
         return;
       }
 
@@ -2490,7 +3358,24 @@ export function createApiApp(): express.Express {
         .order('created_at', { ascending: false })
         .limit(20);
 
-      res.json({ notifications: data || [], databaseConnected: true });
+      res.json({ notifications: data || liveNotifications, databaseConnected: true });
+    }
+  );
+
+  app.patch(
+    '/api/admin/notifications/read-all',
+    requireAuthenticatedSession,
+    requireRole('staff', 'owner', 'manager'),
+    requirePermission('notifications:read'),
+    async (_req, res) => {
+      for (const n of liveNotifications) {
+        n.is_read = true;
+      }
+      const supabase = getSupabaseAdmin();
+      if (supabase) {
+        await supabase.from('notifications').update({ is_read: true }).eq('is_read', false);
+      }
+      res.json({ success: true });
     }
   );
 
@@ -2501,13 +3386,13 @@ export function createApiApp(): express.Express {
     requirePermission('notifications:read'),
     async (req: AuthenticatedRequest, res) => {
       const notifId = req.params.id;
-      const supabase = getSupabaseAdmin();
-      if (!supabase) {
-        res.status(503).json({ error: 'Supabase database is not configured.' });
-        return;
-      }
+      const target = liveNotifications.find((n) => n.id === notifId);
+      if (target) target.is_read = true;
 
-      await supabase.from('notifications').update({ is_read: true }).eq('id', notifId);
+      const supabase = getSupabaseAdmin();
+      if (supabase) {
+        await supabase.from('notifications').update({ is_read: true }).eq('id', notifId);
+      }
       res.json({ success: true });
     }
   );
@@ -2833,6 +3718,15 @@ export function createApiApp(): express.Express {
     requireRole('owner', 'manager'),
     requirePermission('analytics:read'),
     async (req: AuthenticatedRequest, res) => {
+      const geminiKey = (process.env.GEMINI_API_KEY || '').trim();
+      if (!geminiKey || geminiKey === 'MY_GEMINI_API_KEY') {
+        res.status(503).json({
+          error:
+            'Gemini API key is not configured. Add GEMINI_API_KEY in Settings > Secrets to generate AI Business Insights.',
+        });
+        return;
+      }
+
       const period = typeof req.body?.period === 'string' ? req.body.period : 'monthly';
       const topic = typeof req.body?.topic === 'string' ? req.body.topic : 'complete';
 
@@ -2871,7 +3765,8 @@ export function createApiApp(): express.Express {
 
       const dataSummary = {
         restaurantName: 'Yomat Kitchen',
-        location: 'Behind Science Laboratory Technology, University of Benin, Uselu, Benin City, Edo State, Nigeria',
+        location:
+          'Behind Science Laboratory Technology, University of Benin, Uselu, Benin City, Edo State, Nigeria',
         reportingPeriod: period,
         analysisTopic: topic,
         totalOrders: totalOrdersCount,
@@ -2889,7 +3784,7 @@ export function createApiApp(): express.Express {
       };
 
       const ai = new GoogleGenAI({
-        apiKey: process.env.GEMINI_API_KEY,
+        apiKey: geminiKey,
         httpOptions: {
           headers: { 'User-Agent': 'aistudio-build' },
         },
@@ -2907,31 +3802,26 @@ export function createApiApp(): express.Express {
           contents: prompt,
           config: {
             systemInstruction:
-              'You are an expert restaurant management and business intelligence AI for Yomat Kitchen in Uselu, Benin City, Edo State. Return only valid JSON adhering strictly to the requested schema.',
+              'You are an expert restaurant management and business intelligence AI for Yomat Kitchen in Uselu, Benin City, Edo State. Return only valid JSON adhering strictly to the requested schema. Do not invent sales or review counts beyond the provided JSON.',
             responseMimeType: 'application/json',
           },
         });
 
-        const rawText = result.text || '{}';
-        let reportJson = {};
+        const rawText = (result.text || '{}')
+          .trim()
+          .replace(/^```json\s*/i, '')
+          .replace(/^```\s*/i, '')
+          .replace(/```$/i, '')
+          .trim();
+
+        let reportJson: Record<string, unknown>;
         try {
-          reportJson = JSON.parse(rawText.trim());
+          reportJson = JSON.parse(rawText);
         } catch {
-          reportJson = {
-            executiveSummary: 'Yomat Kitchen performance summary based on recorded orders and customer feedback.',
-            businessPerformanceOverview: `Total recorded paid revenue stands at ₦${totalRevenue.toLocaleString()} across ${paidOrdersCount} completed orders.`,
-            customerSatisfaction: `Average customer rating is ${avgRating} / 5.0 across ${approvedReviews.length} verified reviews.`,
-            customerSentimentAnalysis: 'Insufficient verified review data recorded yet to determine detailed sentiment trends.',
-            strengths: ['Direct University of Benin, Uselu location', 'Streamlined phone and WhatsApp ordering'],
-            areasForImprovement: ['Collect verified customer feedback once live orders begin'],
-            bestPerformingMeals: [],
-            mealsNeedingAttention: [],
-            salesAndOrderingTrends: 'No historical trend data recorded yet.',
-            businessOpportunities: ['Student and staff walk-in lunch service near UNIBEN', 'Campus and community event catering enquiries'],
-            aiRecommendations: ['Confirm official daily menu items and pricing in Manager Portal'],
-            managementActionPlan: ['Finalize menu catalog and service hours in Website Management'],
-            dataCoverageNote: `Analyzed ${paidOrdersCount} orders and ${approvedReviews.length} verified customer reviews for period: ${period}.`,
-          };
+          res.status(502).json({
+            error: 'Gemini returned an unreadable response format. Please retry generating the report.',
+          });
+          return;
         }
 
         recordAuthAuditEvent({
@@ -2954,10 +3844,10 @@ export function createApiApp(): express.Express {
         });
       } catch (err) {
         console.error('AI Insights generation error:', err);
-        res.status(500).json({
-          error:
-            err instanceof Error ? err.message : 'Failed to generate AI business insights report.',
-        });
+        const msg = err instanceof Error ? err.message : 'Failed to generate AI business insights report.';
+        const statusCode =
+          msg.includes('API_KEY') || msg.includes('PERMISSION_DENIED') ? 403 : 502;
+        res.status(statusCode).json({ error: msg });
       }
     }
   );
@@ -2969,6 +3859,15 @@ export function createApiApp(): express.Express {
     requireRole('owner', 'manager'),
     requirePermission('analytics:read'),
     async (req: AuthenticatedRequest, res) => {
+      const geminiKey = (process.env.GEMINI_API_KEY || '').trim();
+      if (!geminiKey || geminiKey === 'MY_GEMINI_API_KEY') {
+        res.status(503).json({
+          error:
+            'Gemini API key is not configured. Add GEMINI_API_KEY in Settings > Secrets to chat with the AI Business Assistant.',
+        });
+        return;
+      }
+
       const question = typeof req.body?.question === 'string' ? req.body.question.trim() : '';
       if (!question) {
         res.status(400).json({ error: 'Question is required.' });
@@ -3010,7 +3909,7 @@ export function createApiApp(): express.Express {
       )}`;
 
       const ai = new GoogleGenAI({
-        apiKey: process.env.GEMINI_API_KEY,
+        apiKey: geminiKey,
         httpOptions: {
           headers: { 'User-Agent': 'aistudio-build' },
         },
@@ -3029,9 +3928,10 @@ export function createApiApp(): express.Express {
           answer: result.text || 'I could not generate an answer at this moment.',
         });
       } catch (err) {
-        res.status(500).json({
-          error: err instanceof Error ? err.message : 'AI Assistant failed to respond.',
-        });
+        const msg = err instanceof Error ? err.message : 'AI Assistant failed to respond.';
+        const statusCode =
+          msg.includes('API_KEY') || msg.includes('PERMISSION_DENIED') ? 403 : 502;
+        res.status(statusCode).json({ error: msg });
       }
     }
   );

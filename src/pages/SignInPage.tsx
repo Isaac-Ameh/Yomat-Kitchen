@@ -128,8 +128,14 @@ export function SignInPage() {
               </ul>
               <div className="pt-2 flex flex-wrap gap-3">
                 <Link
-                  to="/menu"
+                  to="/admin"
                   className="px-5 py-2.5 rounded-lg bg-[#5A0B1E] hover:bg-[#731129] text-[#FAF7F2] text-sm font-medium transition-colors"
+                >
+                  Open Admin Portal
+                </Link>
+                <Link
+                  to="/menu"
+                  className="px-5 py-2.5 rounded-lg border border-[#1C1917]/15 text-sm font-medium text-[#1C1917] hover:bg-[#F4EFE8] transition-colors"
                 >
                   Browse Our Menu
                 </Link>

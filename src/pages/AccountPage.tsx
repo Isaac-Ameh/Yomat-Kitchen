@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { UserProfile } from '@clerk/react';
-import { LogOut, ShoppingBag, UtensilsCrossed, Star, MessageSquare, CheckCircle2, Clock } from 'lucide-react';
+import { LogOut, ShoppingBag, UtensilsCrossed, Star, CheckCircle2, Clock } from 'lucide-react';
 import { useAppAuth } from '../context/AppAuthContext';
-import { RESTAURANT_IMAGES, formatNaira } from '../data/meals';
+import { parseApiJson } from '../lib/api';
+import { RESTAURANT_IMAGES } from '../data/meals';
 import { PageHero } from '../components/PageHero';
 
 interface ReviewableItem {
@@ -20,7 +21,7 @@ interface ReviewableOrder {
 }
 
 export function AccountPage() {
-  const { isClerkConfigured, signOut, fullName, email, getToken } = useAppAuth();
+  const { isClerkConfigured, isSignedIn, signOut, fullName, email, getToken } = useAppAuth();
   const [reviewableOrders, setReviewableOrders] = useState<ReviewableOrder[]>([]);
   const [loadingOrders, setLoadingOrders] = useState(true);
   const [reviewModalOrder, setReviewModalOrder] = useState<ReviewableOrder | null>(null);
@@ -36,14 +37,28 @@ export function AccountPage() {
   const [successMessage, setSuccessMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
 
-  const fetchReviewableOrders = async () => {
+  const fetchReviewableOrders = useCallback(async () => {
+    if (!isSignedIn) {
+      setReviewableOrders([]);
+      setLoadingOrders(false);
+      return;
+    }
+
     try {
-      const token = getToken ? await getToken() : null;
+      const token = await getToken();
+      if (!token) {
+        setReviewableOrders([]);
+        return;
+      }
       const res = await fetch('/api/orders/reviewable', {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        credentials: 'same-origin',
+        headers: { Authorization: `Bearer ${token}` },
       });
-      const data = await res.json();
-      if (res.ok && Array.isArray(data.orders)) {
+      const data = await parseApiJson<{ orders?: ReviewableOrder[] }>(
+        res,
+        'Unable to load your paid orders.'
+      );
+      if (Array.isArray(data.orders)) {
         setReviewableOrders(data.orders);
       }
     } catch (err) {
@@ -51,11 +66,11 @@ export function AccountPage() {
     } finally {
       setLoadingOrders(false);
     }
-  };
+  }, [isSignedIn, getToken]);
 
   useEffect(() => {
     void fetchReviewableOrders();
-  }, []);
+  }, [fetchReviewableOrders]);
 
   const handleOpenReviewModal = (order: ReviewableOrder, mealId: string) => {
     setReviewModalOrder(order);
@@ -83,12 +98,16 @@ export function AccountPage() {
     setSuccessMessage('');
 
     try {
-      const token = getToken ? await getToken() : null;
+      const token = await getToken();
+      if (!token) {
+        throw new Error('Please sign in again to submit a verified review.');
+      }
       const res = await fetch('/api/reviews', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {
           'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
           orderReference: reviewModalOrder.reference,
@@ -102,10 +121,7 @@ export function AccountPage() {
           comment,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to submit review.');
-      }
+      await parseApiJson<{ success?: boolean }>(res, 'Failed to submit review.');
 
       setSuccessMessage('Verified review submitted successfully! Thank you for helping Yomat Kitchen.');
       setTimeout(() => {

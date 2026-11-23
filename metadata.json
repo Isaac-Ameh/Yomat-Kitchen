@@ -1,0 +1,6 @@
+{
+  "name": "Easi Mark Kitchen",
+  "description": "Nigerian restaurant and food services in Ugbowo, Benin City, Nigeria serving Nigerian rice dishes, spaghetti, beans & plantain, dodo, swallows, and traditional soups.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
